@@ -39,16 +39,18 @@ type FileInfo struct {
 }
 
 var (
-	dirFlag     = flag.String("dir", ".", "Директория для сканирования")
-	excludeFlag = flag.String("exclude", "", "Исключения через запятую")
-	outputFlag  = flag.String("output", "structure.json", "Выходной JSON-файл")
-	prettyFlag  = flag.Bool("pretty", false, "Форматировать JSON красиво")
-	streamFlag  = flag.Bool("stream", false, "Потоковая запись в temp")
-	resumeFlag  = flag.Bool("resume", false, "Продолжить сканирование (только с --stream)")
-	mergeFlag   = flag.String("merge", "", "Список JSON-файлов через запятую для объединения")
-	workersFlag = flag.Int("workers", runtime.NumCPU(), "Количество параллельных потоков сканирования")
-	skipMd5Flag = flag.Bool("no-md5", false, "Не вычислять MD5 для файлов")
-	ioLimitFlag = flag.Int("io-limit", 16, "Максимум одновременных I/O операций (чтение/MD5/Stat)")
+	dirFlag       = flag.String("dir", ".", "Директория для сканирования")
+	excludeFlag   = flag.String("exclude", "", "Исключения через запятую")
+	outputFlag    = flag.String("output", "structure.json", "Выходной JSON-файл")
+	prettyFlag    = flag.Bool("pretty", false, "Форматировать JSON красиво")
+	streamFlag    = flag.Bool("stream", false, "Потоковая запись в temp")
+	resumeFlag    = flag.Bool("resume", false, "Продолжить сканирование (только с --stream)")
+	mergeFlag     = flag.String("merge", "", "Список JSON-файлов через запятую для объединения")
+	workersFlag   = flag.Int("workers", runtime.NumCPU(), "Количество параллельных потоков сканирования")
+	skipMd5Flag   = flag.Bool("no-md5", false, "Не вычислять MD5 для файлов")
+	ioLimitFlag   = flag.Int("io-limit", 16, "Максимум одновременных I/O операций (чтение/MD5/Stat)")
+	dedupeFlag    = flag.Bool("dedupe", false, "Удалять дубликаты по FullPathOrig при объединении JSON файлов")
+	mergeFlatFlag = flag.Bool("merge-flat", false, "Сохранять объединённый результат в плоском виде ([]FileInfo) вместо иерархического дерева")
 )
 
 var (
@@ -104,28 +106,140 @@ func main() {
 func mergeMode() {
 	files := strings.Split(*mergeFlag, ",")
 	fmt.Printf("🔗 Объединение %d файлов...\n", len(files))
-	var all []FileInfo
+
+	all := make([]FileInfo, 0, 10000)
+	var seen map[string]struct{}
+	if *dedupeFlag {
+		seen = make(map[string]struct{})
+		fmt.Println("⚙️  Включено удаление дубликатов по FullPathOrig")
+	} else {
+		fmt.Println("⚙️  Дубликаты не будут удаляться")
+	}
+
 	for _, file := range files {
 		file = strings.TrimSpace(file)
 		if file == "" {
 			continue
 		}
+
+		fmt.Printf("📥 Чтение %s...\n", file)
 		data, err := os.ReadFile(file)
 		if err != nil {
-			fmt.Printf("Ошибка чтения %s: %v\n", file, err)
+			fmt.Printf("❌ Ошибка чтения %s: %v\n", file, err)
 			continue
 		}
-		var flat []FileInfo
-		if err := json.Unmarshal(data, &flat); err != nil {
-			fmt.Printf("Ошибка парсинга %s: %v\n", file, err)
+
+		var parsedFlat []FileInfo
+		var parsedTree FileInfo
+		flatParsed := false
+
+		// Сначала пробуем flat JSON ([]FileInfo)
+		if err := json.Unmarshal(data, &parsedFlat); err == nil {
+			if len(parsedFlat) > 0 {
+				all = appendFlatUnique(all, parsedFlat, seen)
+				fmt.Printf("📄 %s: flat-массив (%d элементов)\n", file, len(parsedFlat))
+				continue
+			}
+		}
+
+		// Иначе пробуем иерархическую структуру (FileInfo)
+		if err := json.Unmarshal(data, &parsedTree); err == nil {
+			if parsedTree.FullName != "" || len(parsedTree.Children) > 0 {
+				treeFlat := flattenTree(parsedTree)
+				all = appendFlatUnique(all, treeFlat, seen)
+				fmt.Printf("🌲 %s: дерево -> %d элементов\n", file, len(treeFlat))
+				flatParsed = true
+			}
+		}
+
+		if !flatParsed && len(parsedFlat) == 0 {
+			fmt.Printf("⚠️ %s: не удалось определить формат JSON\n", file)
 			continue
 		}
-		all = append(all, flat...)
 	}
+
+	if len(all) == 0 {
+		fmt.Println("⚠️ Нет данных для объединения — проверьте входные JSON-файлы.")
+		return
+	}
+
+	fmt.Printf("📦 Всего элементов после объединения: %d\n", len(all))
+
+	// --- Вывод в зависимости от режима ---
+	if *mergeFlatFlag {
+		fmt.Println("📤 Сохранение в формате flat ([]FileInfo)")
+		writeFlatJSON(*outputFlag, all, *prettyFlag)
+		fmt.Printf("✅ Объединение завершено. Итоговый файл: %s\n", *outputFlag)
+		return
+	}
+
+	// --- Иерархический вывод ---
+	fmt.Println("📤 Сборка иерархического дерева...")
 	root := assembleNestedFromFlat(all)
 	computeDirSizes(&root)
+	recountChildCounts(&root)
 	writeFinalJSON(*outputFlag, root, *prettyFlag)
-	fmt.Println("✅ Объединение завершено.")
+	fmt.Printf("✅ Объединение завершено. Итоговый файл: %s\n", *outputFlag)
+}
+
+// appendFlatUnique добавляет элементы с опциональным dedupe
+func appendFlatUnique(dst, src []FileInfo, seen map[string]struct{}) []FileInfo {
+	if seen == nil {
+		return append(dst, src...)
+	}
+	for _, f := range src {
+		if _, ok := seen[f.FullPathOrig]; ok {
+			continue
+		}
+		seen[f.FullPathOrig] = struct{}{}
+		dst = append(dst, f)
+	}
+	return dst
+}
+
+// flattenTree превращает дерево в flat []FileInfo
+func flattenTree(root FileInfo) []FileInfo {
+	var flat []FileInfo
+	var walk func(FileInfo)
+	walk = func(node FileInfo) {
+		flat = append(flat, node)
+		for _, c := range node.Children {
+			walk(c)
+		}
+	}
+	walk(root)
+	return flat
+}
+
+// recountChildCounts пересчитывает ChildCount у всех директорий
+func recountChildCounts(node *FileInfo) int {
+	if !node.IsDir {
+		node.ChildCount = 0
+		return 0
+	}
+	node.ChildCount = len(node.Children)
+	for i := range node.Children {
+		recountChildCounts(&node.Children[i])
+	}
+	return node.ChildCount
+}
+
+// writeFlatJSON записывает массив []FileInfo в JSON
+func writeFlatJSON(output string, arr []FileInfo, pretty bool) {
+	f, err := os.Create(output)
+	if err != nil {
+		fmt.Println("Ошибка создания выходного файла:", err)
+		return
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
+	if err := enc.Encode(arr); err != nil {
+		fmt.Println("Ошибка записи JSON:", err)
+	}
 }
 
 // --- Worker pool с потоковой записью ---
@@ -756,4 +870,13 @@ shouldExclude теперь принимает полный путь и испо�
 Расширен классификатор типов файлов.
 
 Убран неиспользуемый humanSize2 и дубляжи вычислений в makeFlatEntry.
+
+
+
+Возможность	Флаг	Описание
+Удаление дубликатов	--dedupe	фильтрация по FullPathOrig
+Flat-вывод	--merge-flat	сохраняет как []FileInfo, без дерева
+Совместимость	автоматическая	поддерживает и плоские, и древовидные JSON
+Пересчёт ChildCount	всегда	корректное количество детей в каталоге
+Пересчёт SizeBytes и дат	всегда	через computeDirSizes()
 */
