@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -33,17 +34,20 @@ type FileInfo struct {
 	Perm         string     `json:"Perm"`
 	Md5          string     `json:"Md5"`
 	FileType     string     `json:"FileType"`
+	ChildCount   int        `json:"ChildCount"`
 	Children     []FileInfo `json:"Children,omitempty"`
 }
 
 var (
 	dirFlag     = flag.String("dir", ".", "Директория для сканирования")
-	excludeFlag = flag.String("exclude", "", "Исключения через запятую (подстроки путей, регистронезависимо)")
+	excludeFlag = flag.String("exclude", "", "Исключения через запятую")
 	outputFlag  = flag.String("output", "structure.json", "Выходной JSON-файл")
 	prettyFlag  = flag.Bool("pretty", false, "Форматировать JSON красиво")
 	streamFlag  = flag.Bool("stream", false, "Потоковая запись в temp")
 	resumeFlag  = flag.Bool("resume", false, "Продолжить сканирование (только с --stream)")
 	mergeFlag   = flag.String("merge", "", "Список JSON-файлов через запятую для объединения")
+	workersFlag = flag.Int("workers", 8, "Количество параллельных потоков сканирования")
+	skipMd5Flag = flag.Bool("no-md5", false, "Не вычислять MD5 для файлов")
 )
 
 var (
@@ -68,7 +72,6 @@ func main() {
 		}
 	}()
 
-	// подготавливаем исключения
 	if *excludeFlag != "" {
 		for _, e := range strings.Split(*excludeFlag, ",") {
 			e = strings.TrimSpace(e)
@@ -80,106 +83,130 @@ func main() {
 
 	streamTempName = strings.TrimSuffix(*outputFlag, ".json") + "_temp.json"
 
-	// режим объединения заранее сформированных flat JSON-ов
 	if *mergeFlag != "" {
 		mergeMode()
 		return
 	}
 
-	// обычный режим (без стрима)
 	if !*streamFlag {
-		processNormal()
+		processParallel()
 		return
 	}
 
-	// потоковый режим с возможностью resume
-	if *streamFlag {
-		if *resumeFlag {
-			existingPaths = loadExistingTempFlatList(streamTempName)
-			fmt.Printf("🔁 Режим resume: найдено %d уже обработанных файлов\n", len(existingPaths))
-		}
+	fmt.Println("Параллельный режим stream пока не используется — запусти без --stream")
+}
 
-		var err error
-		streamFileHandle, err = os.OpenFile(streamTempName, os.O_CREATE|os.O_RDWR, 0644)
-		if err != nil {
-			log.Fatalf("Ошибка открытия temp файла: %v", err)
-		}
-		if *resumeFlag && len(existingPaths) > 0 {
-			appendToExistingJSON(streamFileHandle)
-		} else {
-			_ = streamFileHandle.Truncate(0)
-			_, _ = streamFileHandle.Seek(0, 0)
-			_, _ = streamFileHandle.WriteString("[\n")
-		}
-		streamWriter = bufio.NewWriter(streamFileHandle)
-	}
-
-	rootDirAbs, _ := filepath.Abs(*dirFlag)
-	fmt.Printf("📁 Начало сканирования: %s\n", rootDirAbs)
-
-	// Walk со строгим исключением целых поддеревьев
-	err := filepath.Walk(*dirFlag, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// пропускаем проблемные элементы, но не рушим проход
-			return nil
-		}
-		abs, _ := filepath.Abs(path)
-
-		// исключения — по полному пути
-		if shouldExclude(abs) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// в режиме resume пропускаем уже записанные
-		if *resumeFlag && existingPaths != nil {
-			if _, exists := existingPaths[abs]; exists {
-				return nil
-			}
-		}
-
-		entry := makeFlatEntry(abs, info)
-
-		if *streamFlag {
-			b, _ := json.Marshal(entry)
-			// добавляем запятую, если это не первый элемент
-			if atomic.LoadInt64(&filesProcessed) > 0 || len(existingPaths) > 0 {
-				_, _ = streamWriter.WriteString(",\n")
-			}
-			_, _ = streamWriter.Write(b)
-			// флашим периодически
-			if atomic.AddInt64(&filesProcessed, 1)%500 == 0 {
-				_ = streamWriter.Flush()
-			}
-		} else {
-			atomic.AddInt64(&filesProcessed, 1)
-		}
-		printProgress()
-		return nil
-	})
+// --- Параллельный обход ---
+func processParallel() {
+	rootAbs, err := filepath.Abs(*dirFlag)
 	if err != nil {
-		log.Printf("Ошибка обхода: %v", err)
+		log.Fatal(err)
+	}
+	fmt.Printf("📁 Начало сканирования: %s\n", rootAbs)
+
+	var wg sync.WaitGroup
+	jobs := make(chan string, *workersFlag*2)
+	results := make(chan FileInfo, *workersFlag*2)
+
+	for i := 0; i < *workersFlag; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				fi, err := os.Stat(path)
+				if err != nil {
+					continue
+				}
+				if shouldExclude(path) {
+					continue
+				}
+				entry := processPath(path, fi)
+				results <- entry
+			}
+		}()
 	}
 
-	if *streamFlag {
-		_, _ = streamWriter.WriteString("\n]\n")
-		_ = streamWriter.Flush()
-		_ = streamFileHandle.Close()
-		fmt.Printf("✅ Записан temp: %s\n", streamTempName)
-		logger.Printf("Temp file saved: %s", streamTempName)
+	go func() {
+		defer close(jobs)
+		filepath.WalkDir(*dirFlag, func(path string, d os.DirEntry, err error) error {
+			if err == nil {
+				jobs <- path
+			}
+			return nil
+		})
+	}()
 
-		flat, err := readFlatArrayFromFile(streamTempName)
-		if err != nil {
-			log.Fatalf("Ошибка чтения temp: %v", err)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var flat []FileInfo
+	for r := range results {
+		if r.FullName != "" {
+			flat = append(flat, r)
+			printProgress()
 		}
-		root := assembleNestedFromFlat(flat)
-		computeDirSizes(&root)
-		writeFinalJSON(*outputFlag, root, *prettyFlag)
-		fmt.Printf("🎉 Результат собран: %s\n", *outputFlag)
 	}
-	logger.Printf("Готово.")
+
+	root := assembleNestedFromFlat(flat)
+	computeDirSizes(&root)
+	writeFinalJSON(*outputFlag, root, *prettyFlag)
+
+	fmt.Printf("✅ Готово. Всего элементов: %d\n", atomic.LoadInt64(&filesProcessed))
+	fmt.Printf("🕒 Время выполнения: %v\n", time.Since(startTime))
+}
+
+// --- Обработка отдельного пути ---
+func processPath(path string, info os.FileInfo) FileInfo {
+	atomic.AddInt64(&filesProcessed, 1)
+
+	parent := filepath.Dir(path)
+	if parent == "." {
+		parent = ""
+	}
+	size := int64(0)
+	if !info.IsDir() {
+		size = info.Size()
+	}
+
+	entry := FileInfo{
+		IsDir:        info.IsDir(),
+		FullName:     info.Name(),
+		Ext:          strings.TrimPrefix(filepath.Ext(info.Name()), "."),
+		NameOnly:     strings.TrimSuffix(info.Name(), filepath.Ext(info.Name())),
+		SizeBytes:    size,
+		SizeHuman:    humanSize(size),
+		FullPath:     path,
+		FullPathOrig: path,
+		ParentDir:    parent,
+		Created:      info.ModTime(),
+		Updated:      info.ModTime(),
+		Perm:         info.Mode().String(),
+		FileType:     detectFileType(info.Name()),
+	}
+
+	if info.IsDir() {
+		entries, _ := os.ReadDir(path)
+		entry.ChildCount = len(entries)
+		var total int64
+		for _, e := range entries {
+			st, err := e.Info()
+			if err == nil {
+				total += st.Size()
+			}
+		}
+		entry.SizeBytes = total
+		entry.SizeHuman = humanSize(total)
+		if !*skipMd5Flag {
+			entry.Md5 = md5String(info.Name())
+		}
+	} else {
+		if !*skipMd5Flag {
+			entry.Md5 = fileMD5(path)
+		}
+	}
+	return entry
 }
 
 // --- Merge Mode ---
