@@ -295,94 +295,80 @@ func mergeRootChildren(roots []FileInfo) FileInfo {
 	rootName := strings.Join(names, "+")
 
 	dedupe := *dedupeFlag
-	childMap := make(map[string]*FileInfo)
-	children := make([]FileInfo, 0)
+	merged := roots[0]
 
-	for _, r := range roots {
-		for _, ch := range r.Children {
-			existing, exists := childMap[ch.FullName]
-			if exists && ch.IsDir && existing.IsDir {
-				// ✅ директории с одинаковыми именами объединяются всегда
-				merged := mergeDirectories(*existing, ch, dedupe)
-				*existing = merged
-			} else if exists && !ch.IsDir && dedupe {
-				// ✅ дубликат файла при dedupe=true игнорируется
+	for i := 1; i < len(roots); i++ {
+		merged = mergeDirectories(merged, roots[i], dedupe)
+	}
+
+	merged.FullName = rootName
+	merged.NameOnly = rootName
+	merged.FullPath = rootName
+	merged.FileType = "merged"
+
+	merged.ChildCount = len(merged.Children)
+	var total int64
+	for _, c := range merged.Children {
+		total += c.SizeBytes
+	}
+	merged.SizeBytes = total
+	merged.SizeHuman = humanSize(total)
+
+	return merged
+}
+
+// mergeDirectories рекурсивно объединяет две директории любой глубины.
+// Каталоги с одинаковыми именами всегда объединяются рекурсивно.
+// Файлы с одинаковыми именами — только если dedupe=false дублируются.
+func mergeDirectories(a, b FileInfo, dedupe bool) FileInfo {
+	// создаём копию a, чтобы не трогать оригинал
+	result := a
+
+	// строим карту существующих детей по имени
+	existing := make(map[string]*FileInfo, len(result.Children))
+	for i := range result.Children {
+		existing[result.Children[i].FullName] = &result.Children[i]
+	}
+
+	for _, ch := range b.Children {
+		if ex, ok := existing[ch.FullName]; ok {
+			// если совпали имена
+			if ch.IsDir && ex.IsDir {
+				// ✅ объединяем каталоги
+				merged := mergeDirectories(*ex, ch, dedupe)
+				*ex = merged
+			} else if !ch.IsDir && !dedupe {
+				// ✅ при dedupe=false добавляем даже если имя совпадает
+				result.Children = append(result.Children, ch)
+			} else if !ch.IsDir && dedupe {
+				// ✅ при dedupe=true игнорируем дубликат файла
 				continue
-			} else {
-				// ✅ файл (или уникальное имя)
-				c := ch
-				children = append(children, c)
-				if c.IsDir {
-					childMap[c.FullName] = &c
-				} else if dedupe {
-					childMap[c.FullName] = &c
-				}
 			}
+		} else {
+			// ✅ уникальный элемент — добавляем
+			result.Children = append(result.Children, ch)
+			existing[ch.FullName] = &result.Children[len(result.Children)-1]
 		}
 	}
 
-	// формируем итоговый корень
-	result := FileInfo{
-		IsDir:      true,
-		FullName:   rootName,
-		NameOnly:   rootName,
-		FullPath:   rootName,
-		FileType:   "merged",
-		Children:   children,
-		ChildCount: len(children),
-	}
-
-	// пересчёт размера
+	// пересчитываем размер и количество
 	var total int64
-	for _, c := range children {
-		total += c.SizeBytes
+	for i := range result.Children {
+		total += result.Children[i].SizeBytes
 	}
 	result.SizeBytes = total
 	result.SizeHuman = humanSize(total)
+	result.ChildCount = len(result.Children)
 
+	// сортируем для стабильности
 	sort.Slice(result.Children, func(i, j int) bool {
+		if result.Children[i].IsDir != result.Children[j].IsDir {
+			return result.Children[i].IsDir
+		}
 		return strings.ToLower(result.Children[i].FullName) < strings.ToLower(result.Children[j].FullName)
 	})
 
 	return result
-}
-
-// mergeDirectories рекурсивно объединяет директории по имени.
-// Каталоги всегда объединяются; файлы с одинаковыми именами — только если dedupe=true.
-func mergeDirectories(a, b FileInfo, dedupe bool) FileInfo {
-	dir := a
-	childMap := make(map[string]*FileInfo)
-
-	for i := range dir.Children {
-		child := &dir.Children[i]
-		childMap[child.FullName] = child
-	}
-
-	for _, ch := range b.Children {
-		if existing, ok := childMap[ch.FullName]; ok && ch.IsDir && existing.IsDir {
-			// ✅ директории с одинаковыми именами объединяются всегда
-			merged := mergeDirectories(*existing, ch, dedupe)
-			*existing = merged
-		} else if ok && !ch.IsDir && dedupe {
-			// ✅ дубликат файла пропускаем при dedupe=true
-			continue
-		} else {
-			// ✅ добавляем элемент (файл или уникальную директорию)
-			c := ch
-			dir.Children = append(dir.Children, c)
-			childMap[c.FullName] = &dir.Children[len(dir.Children)-1]
-		}
-	}
-
-	// пересчёт размера и количества
-	var total int64
-	for _, c := range dir.Children {
-		total += c.SizeBytes
-	}
-	dir.SizeBytes = total
-	dir.SizeHuman = humanSize(total)
-	dir.ChildCount = len(dir.Children)
-	return dir
 }
 
 // appendFlatUnique добавляет элементы с опциональным dedupe
