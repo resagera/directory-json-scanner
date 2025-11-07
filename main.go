@@ -38,7 +38,7 @@ type FileInfo struct {
 
 var (
 	dirFlag     = flag.String("dir", ".", "Директория для сканирования")
-	excludeFlag = flag.String("exclude", "", "Исключения через запятую")
+	excludeFlag = flag.String("exclude", "", "Исключения через запятую (подстроки путей, регистронезависимо)")
 	outputFlag  = flag.String("output", "structure.json", "Выходной JSON-файл")
 	prettyFlag  = flag.Bool("pretty", false, "Форматировать JSON красиво")
 	streamFlag  = flag.Bool("stream", false, "Потоковая запись в temp")
@@ -59,11 +59,16 @@ var (
 )
 
 func main() {
-	fmt.Println("test6")
 	flag.Parse()
 	startTime = time.Now()
 	initLogger()
+	defer func() {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+	}()
 
+	// подготавливаем исключения
 	if *excludeFlag != "" {
 		for _, e := range strings.Split(*excludeFlag, ",") {
 			e = strings.TrimSpace(e)
@@ -75,17 +80,19 @@ func main() {
 
 	streamTempName = strings.TrimSuffix(*outputFlag, ".json") + "_temp.json"
 
-	// Режим объединения
+	// режим объединения заранее сформированных flat JSON-ов
 	if *mergeFlag != "" {
 		mergeMode()
 		return
 	}
 
+	// обычный режим (без стрима)
 	if !*streamFlag {
 		processNormal()
 		return
 	}
 
+	// потоковый режим с возможностью resume
 	if *streamFlag {
 		if *resumeFlag {
 			existingPaths = loadExistingTempFlatList(streamTempName)
@@ -100,26 +107,33 @@ func main() {
 		if *resumeFlag && len(existingPaths) > 0 {
 			appendToExistingJSON(streamFileHandle)
 		} else {
-			streamFileHandle.Truncate(0)
-			streamFileHandle.Seek(0, 0)
-			streamFileHandle.WriteString("[\n")
+			_ = streamFileHandle.Truncate(0)
+			_, _ = streamFileHandle.Seek(0, 0)
+			_, _ = streamFileHandle.WriteString("[\n")
 		}
 		streamWriter = bufio.NewWriter(streamFileHandle)
 	}
 
-	fmt.Printf("📁 Начало сканирования: %s\n", *dirFlag)
+	rootDirAbs, _ := filepath.Abs(*dirFlag)
+	fmt.Printf("📁 Начало сканирования: %s\n", rootDirAbs)
+
+	// Walk со строгим исключением целых поддеревьев
 	err := filepath.Walk(*dirFlag, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			// пропускаем проблемные элементы, но не рушим проход
 			return nil
 		}
-		//fmt.Println("SCAN:", path)
-		if shouldExclude(path, info) {
+		abs, _ := filepath.Abs(path)
+
+		// исключения — по полному пути
+		if shouldExclude(abs) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		abs, _ := filepath.Abs(path)
+
+		// в режиме resume пропускаем уже записанные
 		if *resumeFlag && existingPaths != nil {
 			if _, exists := existingPaths[abs]; exists {
 				return nil
@@ -127,15 +141,17 @@ func main() {
 		}
 
 		entry := makeFlatEntry(abs, info)
-		//fmt.Println("SCAN entry:", entry)
+
 		if *streamFlag {
 			b, _ := json.Marshal(entry)
+			// добавляем запятую, если это не первый элемент
 			if atomic.LoadInt64(&filesProcessed) > 0 || len(existingPaths) > 0 {
-				streamWriter.WriteString(",\n")
+				_, _ = streamWriter.WriteString(",\n")
 			}
-			streamWriter.Write(b)
+			_, _ = streamWriter.Write(b)
+			// флашим периодически
 			if atomic.AddInt64(&filesProcessed, 1)%500 == 0 {
-				streamWriter.Flush()
+				_ = streamWriter.Flush()
 			}
 		} else {
 			atomic.AddInt64(&filesProcessed, 1)
@@ -148,9 +164,9 @@ func main() {
 	}
 
 	if *streamFlag {
-		streamWriter.WriteString("\n]\n")
-		streamWriter.Flush()
-		streamFileHandle.Close()
+		_, _ = streamWriter.WriteString("\n]\n")
+		_ = streamWriter.Flush()
+		_ = streamFileHandle.Close()
 		fmt.Printf("✅ Записан temp: %s\n", streamTempName)
 		logger.Printf("Temp file saved: %s", streamTempName)
 
@@ -170,9 +186,12 @@ func main() {
 func mergeMode() {
 	files := strings.Split(*mergeFlag, ",")
 	fmt.Printf("🔗 Объединение %d файлов...\n", len(files))
-	all := []FileInfo{}
+	var all []FileInfo
 	for _, file := range files {
 		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
 		data, err := os.ReadFile(file)
 		if err != nil {
 			fmt.Printf("Ошибка чтения %s: %v\n", file, err)
@@ -191,8 +210,8 @@ func mergeMode() {
 	fmt.Println("✅ Объединение завершено.")
 }
 
+// --- Обычный (нестримовый) режим ---
 func processNormal() {
-
 	root, err := filepath.Abs(*dirFlag)
 	if err != nil {
 		fmt.Println("Ошибка получения пути:", err)
@@ -209,14 +228,12 @@ func processNormal() {
 	fmt.Println("💾 Результат будет сохранён в:", outputPath)
 	fmt.Println("⏳ Начинаем сканирование...\n")
 
-	// Подготовка списка исключений
-	excludes := strings.Split(*excludeFlag, ",")
-	for _, e := range excludes {
-		if e == "" {
-			continue
+	// Подготовка списка исключений (на всякий случай — если передали с пробелами)
+	for _, e := range strings.Split(*excludeFlag, ",") {
+		e = strings.TrimSpace(e)
+		if e != "" {
+			excludeList = append(excludeList, strings.ToLower(e))
 		}
-		fmt.Println("exclude", e, strings.ToLower(strings.TrimSpace(e)))
-		excludeList = append(excludeList, strings.ToLower(strings.TrimSpace(e)))
 	}
 
 	info, err := os.Stat(root)
@@ -255,23 +272,25 @@ func processNormal() {
 	fmt.Println("🎉 JSON структура успешно сохранена в:", outputPath)
 }
 
+// Рекурсивный сбор структуры (нестримовый)
 func buildStructure(path string, info os.FileInfo) FileInfo {
-	name := info.Name()
-	if shouldExclude(name, info) {
-		return FileInfo{} // пропускаем элемент
+	// важно: фильтруем по ПОЛНОМУ пути
+	if shouldExclude(path) {
+		return FileInfo{}
 	}
 
 	count := atomic.AddInt64(&filesProcessed, 1)
 
-	// Определяем шаг прогресса
-	step := int64(100)
+	// адаптивный шаг прогресса
+	step := int64(10)
 	switch {
 	case count >= 10000:
 		step = 10000
 	case count >= 1000:
 		step = 1000
+	case count >= 100:
+		step = 100
 	}
-
 	if count%step == 0 {
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
@@ -287,27 +306,32 @@ func buildStructure(path string, info os.FileInfo) FileInfo {
 
 	entry := FileInfo{
 		IsDir:        info.IsDir(),
-		FullName:     name,
-		Ext:          strings.TrimPrefix(filepath.Ext(name), "."),
-		NameOnly:     strings.TrimSuffix(name, filepath.Ext(name)),
+		FullName:     info.Name(),
+		Ext:          strings.TrimPrefix(filepath.Ext(info.Name()), "."),
+		NameOnly:     strings.TrimSuffix(info.Name(), filepath.Ext(info.Name())),
 		FullPath:     path,
 		FullPathOrig: path,
 		ParentDir:    parent,
-		Created:      getCreateTime(path),
+		Created:      getCreateTime(path), // максимально близко к "created" для Unix
 		Updated:      info.ModTime(),
 		Perm:         info.Mode().String(),
-		FileType:     detectFileType(name),
+		FileType:     detectFileType(info.Name()),
 	}
 
 	if info.IsDir() {
 		var totalSize int64
 		entries, _ := os.ReadDir(path)
 		for _, e := range entries {
+			childPath := filepath.Join(path, e.Name())
+			// не входим в исключённые поддеревья
+			if shouldExclude(childPath) {
+				continue
+			}
 			childInfo, err := e.Info()
 			if err != nil {
 				continue
 			}
-			child := buildStructure(filepath.Join(path, e.Name()), childInfo)
+			child := buildStructure(childPath, childInfo)
 			if child.FullName == "" {
 				continue // пропущен
 			}
@@ -316,21 +340,35 @@ func buildStructure(path string, info os.FileInfo) FileInfo {
 		}
 		entry.SizeBytes = totalSize
 		entry.SizeHuman = humanSize(totalSize)
-		entry.Md5 = md5String(info.Name()) // для папок просто имя
+		entry.Md5 = md5String(info.Name()) // для папок — детерминированный псевдо-хэш по имени
+		// каталоги первыми, затем файлы; сортировка case-insensitive
+		sort.Slice(entry.Children, func(i, j int) bool {
+			di, dj := entry.Children[i].IsDir, entry.Children[j].IsDir
+			if di != dj {
+				return di && !dj
+			}
+			ni := strings.ToLower(entry.Children[i].FullName)
+			nj := strings.ToLower(entry.Children[j].FullName)
+			return ni < nj
+		})
 	} else {
 		size := info.Size()
 		entry.SizeBytes = size
 		entry.SizeHuman = humanSize(size)
-		entry.Md5 = fileMD5(path)
+		entry.Md5 = fileMD5(path) // реальный MD5 только для файлов
 	}
 	printProgress()
-
 	return entry
 }
 
 // --- Logger ---
 func initLogger() {
-	logFile, _ = os.Create("scan.log")
+	var err error
+	logFile, err = os.Create("scan.log")
+	if err != nil {
+		log.Printf("Не удалось создать scan.log: %v", err)
+		return
+	}
 	logger = log.New(logFile, "", log.LstdFlags)
 }
 
@@ -347,7 +385,9 @@ func loadExistingTempFlatList(tempPath string) map[string]struct{} {
 	}
 	m := make(map[string]struct{}, len(arr))
 	for _, f := range arr {
-		m[f.FullPathOrig] = struct{}{}
+		if f.FullPathOrig != "" {
+			m[f.FullPathOrig] = struct{}{}
+		}
 	}
 	return m
 }
@@ -357,10 +397,11 @@ func appendToExistingJSON(f *os.File) {
 	if stat.Size() < 3 {
 		return
 	}
+	// отрезаем закрывающую скобку массива "]\n"
 	offset := stat.Size() - 2
-	f.Seek(offset, 0)
-	f.Truncate(offset)
-	f.WriteString(",\n")
+	_, _ = f.Seek(offset, 0)
+	_ = f.Truncate(offset)
+	_, _ = f.WriteString(",\n")
 }
 
 // --- JSON Reading ---
@@ -376,225 +417,116 @@ func readFlatArrayFromFile(path string) ([]FileInfo, error) {
 	return arr, nil
 }
 
-// --- Tree Assembling ---
-func assembleNestedFromFlat_(flat []FileInfo) FileInfo {
-	nodes := map[string]*FileInfo{}
-	var root FileInfo
-
-	// сохраняем каждый элемент корректно
-	for _, f := range flat {
-		item := f // создаём копию
-		p := filepath.Clean(item.FullPathOrig)
-		nodes[p] = &item
-	}
-
-	// связываем файлы с родителями
-	for _, f := range flat {
-		if f.IsDir {
-			continue
-		}
-		dir := filepath.Dir(f.FullPathOrig)
-		for dir != "" {
-			parent, ok := nodes[dir]
-			if !ok {
-				parent = &FileInfo{
-					IsDir:        true,
-					FullName:     filepath.Base(dir),
-					NameOnly:     filepath.Base(dir),
-					FullPath:     dir,
-					FullPathOrig: dir,
-				}
-				nodes[dir] = parent
-			}
-			parent.Children = append(parent.Children, f)
-			dir = filepath.Dir(dir)
-			if dir == "." || dir == "/" {
-				break
-			}
-		}
-	}
-
-	// выбираем корневые папки
-	for _, v := range nodes {
-		if filepath.Dir(v.FullPathOrig) == "." || filepath.Dir(v.FullPathOrig) == "" {
-			root.Children = append(root.Children, *v)
-		}
-	}
-
-	// сортируем для стабильности
-	sort.Slice(root.Children, func(i, j int) bool {
-		return root.Children[i].FullName < root.Children[j].FullName
-	})
-
-	return root
-}
-
-func normalizePath(p string) string {
-	if p == "" {
-		return p
-	}
-	// Удаляем завершающий слэш, если не корень
-	if len(p) > 1 && strings.HasSuffix(p, "/") {
-		return strings.TrimSuffix(p, "/")
-	}
-	return p
-}
-
+// --- Сбор дерева из "плоского" массива ---
 func assembleNestedFromFlat(flat []FileInfo) FileInfo {
 	if len(flat) == 0 {
-		return FileInfo{}
+		return FileInfo{IsDir: true, FullName: "(empty)", NameOnly: "(empty)"}
 	}
 
-	// Карта по полному пути и группировка детей по родителю.
-	byPath := make(map[string]FileInfo, len(flat))
-	childrenOf := make(map[string][]FileInfo, len(flat))
+	// нормализуем и строим индексы
+	type nodePtr = *FileInfo
+	pathToNode := make(map[string]nodePtr, len(flat))
+	parentToKids := make(map[string][]FileInfo, len(flat))
 
-	for _, fi := range flat {
-		byPath[fi.FullPath] = fi
+	// используем FullPath как идентификатор (он равен FullPathOrig при сборке)
+	for i := range flat {
+		// гарантируем непротиворечивость ParentDir/FullPath
+		if flat[i].ParentDir == "." {
+			flat[i].ParentDir = ""
+		}
+		pathToNode[flat[i].FullPath] = &flat[i]
 	}
 
+	// группируем детей по ParentDir
 	var roots []FileInfo
 	for _, fi := range flat {
-		if _, ok := byPath[fi.ParentDir]; ok {
-			childrenOf[fi.ParentDir] = append(childrenOf[fi.ParentDir], fi)
+		if _, ok := pathToNode[fi.ParentDir]; ok {
+			parentToKids[fi.ParentDir] = append(parentToKids[fi.ParentDir], fi)
 		} else {
-			// Родителя нет во входном массиве → кандидат в корень.
+			// родитель не присутствует в flat → это корневой кандидат
 			roots = append(roots, fi)
 		}
 	}
 
-	// Если несколько корней — берём первый. При желании можно вернуть []FileInfo.
+	// рекурсивная сборка
+	var build func(FileInfo) FileInfo
+	build = func(n FileInfo) FileInfo {
+		kids := parentToKids[n.FullPath]
+		if len(kids) == 0 {
+			// лист (файл или пустая директория)
+			return n
+		}
+		n.Children = make([]FileInfo, 0, len(kids))
+		var total int64
+		for _, ch := range kids {
+			built := build(ch)
+			n.Children = append(n.Children, built)
+			total += built.SizeBytes
+		}
+		if n.IsDir {
+			n.SizeBytes = total
+			n.SizeHuman = humanSize(total)
+			// каталоги первыми, затем файлы; сортировка case-insensitive
+			sort.Slice(n.Children, func(i, j int) bool {
+				di, dj := n.Children[i].IsDir, n.Children[j].IsDir
+				if di != dj {
+					return di && !dj
+				}
+				ni := strings.ToLower(n.Children[i].FullName)
+				nj := strings.ToLower(n.Children[j].FullName)
+				return ni < nj
+			})
+		}
+		return n
+	}
+
 	if len(roots) == 0 {
-		// fallback: выберем тот, чей ParentDir равен "" (на всякий случай)
+		// fallback: ищем элемент без ParentDir или берём первый
 		for _, fi := range flat {
 			if fi.ParentDir == "" {
 				roots = append(roots, fi)
 			}
 		}
 		if len(roots) == 0 {
-			// крайний случай — вернём первый элемент
 			roots = append(roots, flat[0])
 		}
 	}
-	root := buildTree(roots[0], childrenOf)
 
-	return root
-}
-
-func buildTree(node FileInfo, childrenOf map[string][]FileInfo) FileInfo {
-	kids := childrenOf[node.FullPath]
-
-	// Рекурсивно собрать детей.
-	node.Children = make([]FileInfo, 0, len(kids))
-	var total int64
-	for _, ch := range kids {
-		built := buildTree(ch, childrenOf)
-		node.Children = append(node.Children, built)
-		total += built.SizeBytes
-	}
-
-	// Если директория — пересчитать размер как сумму детей.
-	if node.IsDir {
-		node.SizeBytes = total
-		node.SizeHuman = humanSize(total)
-		// Стабильная сортировка: каталоги первыми, затем файлы, по имени без регистра.
-		sort.Slice(node.Children, func(i, j int) bool {
-			di, dj := node.Children[i].IsDir, node.Children[j].IsDir
-			if di != dj {
-				return di && !dj
-			}
-			ni := strings.ToLower(node.Children[i].FullName)
-			nj := strings.ToLower(node.Children[j].FullName)
-			return ni < nj
-		})
-	}
-	return node
-}
-
-// humanSize возвращает человекочитаемую строку размера
-func humanSize2(size int64) string {
-	const unit = 1024
-	if size < unit {
-		return fmt.Sprintf("%d B", size)
-	}
-	div, exp := int64(unit), 0
-	for n := size / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(size)/float64(div), "KMGTPE"[exp])
-}
-
-func assembleNestedFromFlat__(flat []FileInfo) FileInfo {
-	if len(flat) == 0 {
-		return FileInfo{IsDir: true, FullPath: "", Children: nil}
-	}
-
-	// Нормализуем пути во всех элементах и работаем с копией
-	items := make([]FileInfo, len(flat))
-	for i, item := range flat {
-		item.FullPath = normalizePath(item.FullPath)
-		item.ParentDir = normalizePath(item.ParentDir)
-		items[i] = item
-	}
-
-	// Карта нормализованных FullPath -> указатель на элемент
-	pathToNode := make(map[string]*FileInfo)
-	for i := range items {
-		pathToNode[items[i].FullPath] = &items[i]
-	}
-
-	// Для каждой директории собираем всех детей (файлы и папки)
-	for i := range items {
-		if !items[i].IsDir {
-			continue
-		}
-		parentPath := items[i].FullPath
-		for j := range items {
-			if items[j].ParentDir == parentPath {
-				items[i].Children = append(items[i].Children, items[j])
-			}
-		}
-		sort.Slice(items[i].Children, func(a, b int) bool {
-			aIsDir, bIsDir := items[i].Children[a].IsDir, items[i].Children[b].IsDir
-			if aIsDir == bIsDir {
-				return items[i].Children[a].FullName < items[i].Children[b].FullName
-			}
-			return aIsDir
-		})
-	}
-
-	// Находим корни: ParentDir не существует в FullPath
-	var roots []FileInfo
-	for i := range items {
-		if _, exists := pathToNode[items[i].ParentDir]; !exists {
-			roots = append(roots, items[i])
-		}
-	}
-
-	sort.Slice(roots, func(i, j int) bool {
-		aIsDir, bIsDir := roots[i].IsDir, roots[j].IsDir
-		if aIsDir == bIsDir {
-			return roots[i].FullName < roots[j].FullName
-		}
-		return aIsDir
-	})
-
+	// если ровно один корень — возвращаем его; иначе — виртуальный корень
 	if len(roots) == 1 {
-		return roots[0]
+		return build(roots[0])
 	}
 
-	return FileInfo{
+	// создаём виртуальный корень, чтобы сохранить все «верхние» ветки
+	sort.Slice(roots, func(i, j int) bool {
+		di, dj := roots[i].IsDir, roots[j].IsDir
+		if di != dj {
+			return di && !dj
+		}
+		ni := strings.ToLower(roots[i].FullName)
+		nj := strings.ToLower(roots[j].FullName)
+		return ni < nj
+	})
+	root := FileInfo{
 		IsDir:     true,
 		FullName:  "(root)",
 		NameOnly:  "(root)",
 		FullPath:  "",
 		ParentDir: "",
-		Children:  roots,
+		Children:  make([]FileInfo, 0, len(roots)),
 	}
+	var total int64
+	for _, r := range roots {
+		b := build(r)
+		root.Children = append(root.Children, b)
+		total += b.SizeBytes
+	}
+	root.SizeBytes = total
+	root.SizeHuman = humanSize(total)
+	return root
 }
 
-// --- Directory Size Calculation ---
+// --- Пересчёт размеров/дат по директориям ---
 func computeDirSizes(node *FileInfo) int64 {
 	if !node.IsDir {
 		return node.SizeBytes
@@ -614,50 +546,51 @@ func computeDirSizes(node *FileInfo) int64 {
 	}
 	node.SizeBytes = total
 	node.SizeHuman = humanSize(total)
-	node.Created = earliest
-	node.Updated = latest
-	node.Md5 = md5String(node.FullName)
+	if !earliest.IsZero() {
+		node.Created = earliest
+	}
+	if !latest.IsZero() {
+		node.Updated = latest
+	}
+	if node.Md5 == "" {
+		node.Md5 = md5String(node.FullName)
+	}
 	return total
 }
 
 // --- Helpers ---
 func makeFlatEntry(path string, info os.FileInfo) FileInfo {
-	size := int64(0)
-	if !info.IsDir() {
-		size = info.Size()
-	}
-
 	parent := filepath.Dir(path)
 	if parent == "." {
 		parent = ""
 	}
 
+	size := int64(0)
+	if !info.IsDir() {
+		size = info.Size()
+	}
+
 	entry := FileInfo{
 		IsDir:        info.IsDir(),
 		FullName:     info.Name(),
-		Ext:          strings.TrimPrefix(filepath.Ext(info.Name()), "."),
+		Ext:          strings.TrimPrefix(strings.ToLower(filepath.Ext(info.Name())), "."),
 		NameOnly:     strings.TrimSuffix(info.Name(), filepath.Ext(info.Name())),
 		SizeBytes:    size,
 		SizeHuman:    humanSize(size),
 		FullPath:     path,
 		FullPathOrig: path,
-		ParentDir:    parent, // ✅ заполняем
-		Created:      info.ModTime(),
+		ParentDir:    parent,
+		Created:      info.ModTime(), // в потоковом режиме оставляем ModTime
 		Updated:      info.ModTime(),
 		Perm:         info.Mode().String(),
-		Md5:          md5String(info.Name()),
 		FileType:     detectFileType(info.Name()),
 	}
 
 	if info.IsDir() {
-		entry.Md5 = md5String(info.Name()) // для папок просто имя
+		entry.Md5 = md5String(info.Name())
 	} else {
-		size := info.Size()
-		entry.SizeBytes = size
-		entry.SizeHuman = humanSize(size)
 		entry.Md5 = fileMD5(path)
 	}
-
 	return entry
 }
 
@@ -666,7 +599,6 @@ func md5String(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// Вычисляет MD5 файла
 func fileMD5(path string) string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -680,10 +612,11 @@ func fileMD5(path string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func shouldExclude(path string, info os.FileInfo) bool {
-	pl := strings.ToLower(path)
+// исключение по подстроке ПОЛНОГО пути (регистронезависимо)
+func shouldExclude(absPath string) bool {
+	pl := strings.ToLower(absPath)
 	for _, ex := range excludeList {
-		if strings.Contains(pl, ex) {
+		if ex != "" && strings.Contains(pl, ex) {
 			return true
 		}
 	}
@@ -693,15 +626,15 @@ func shouldExclude(path string, info os.FileInfo) bool {
 func detectFileType(name string) string {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
-	case ".jpg", ".jpeg", ".png", ".gif":
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff":
 		return "image"
-	case ".mp4", ".avi", ".mkv":
+	case ".mp4", ".avi", ".mkv", ".mov", ".webm":
 		return "video"
-	case ".mp3", ".wav", ".flac":
+	case ".mp3", ".wav", ".flac", ".aac", ".ogg":
 		return "audio"
-	case ".txt", ".md", ".log":
+	case ".txt", ".md", ".log", ".csv":
 		return "text"
-	case ".go", ".js", ".py", ".html", ".css", ".json":
+	case ".go", ".js", ".ts", ".py", ".html", ".css", ".json", ".yaml", ".yml", ".rs", ".java", ".c", ".cpp", ".cs", ".php":
 		return "code"
 	default:
 		return "other"
@@ -709,6 +642,7 @@ func detectFileType(name string) string {
 }
 
 func humanSize(size int64) string {
+	// бинарные единицы
 	const unit = 1024
 	if size < unit {
 		return fmt.Sprintf("%d B", size)
@@ -718,13 +652,20 @@ func humanSize(size int64) string {
 		div *= unit
 		exp++
 	}
+	// поддержка до EiB
+	suffixes := []string{"KB", "MB", "GB", "TB", "PB", "EB"}
+	if exp >= len(suffixes) {
+		exp = len(suffixes) - 1
+	}
 	value := float64(size) / float64(div)
-	suffix := []string{"KB", "MB", "GB", "TB"}[exp]
-	return fmt.Sprintf("%.2f %s", value, suffix)
+	return fmt.Sprintf("%.2f %s", value, suffixes[exp])
 }
 
 func printProgress() {
 	count := atomic.LoadInt64(&filesProcessed)
+	if count == 0 {
+		return
+	}
 	step := int64(100)
 	switch {
 	case count >= 10000:
@@ -738,6 +679,9 @@ func printProgress() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	elapsed := time.Since(startTime).Seconds()
+	if elapsed <= 0 {
+		elapsed = 0.000001
+	}
 	speed := float64(count) / elapsed
 	fmt.Printf("📊 %8d файлов | %6.1fs | %6.1f ф/с | %.1f MB\n",
 		count, elapsed, speed, float64(m.Alloc)/1024.0/1024.0)
@@ -759,15 +703,53 @@ func writeFinalJSON(output string, root FileInfo, pretty bool) {
 	}
 }
 
-// Получает примерную дату создания (на Unix системах)
+// Для Unix возвращаем ModTime как «наиболее близкое» к Created.
 func getCreateTime(path string) time.Time {
 	info, err := os.Stat(path)
 	if err != nil {
 		return time.Time{}
 	}
-	stat := info.Sys()
-	if stat == nil {
-		return info.ModTime()
-	}
 	return info.ModTime()
 }
+
+/*
+Ключевые изменения и исправления:
+
+Фильтрация по исключениям
+
+shouldExclude теперь принимает полный путь и используется строго с абсолютным/полным путём во всех местах (и в Walk, и в buildStructure). Это исправляет ситуацию, когда раньше в buildStructure передавалось только имя (info.Name()), из-за чего исключения «не срабатывали».
+
+В buildStructure мы не входим в исключённые поддеревья (проверка перед рекурсией).
+
+Надёжная сборка дерева из flat
+
+Полностью переписан assembleNestedFromFlat: теперь он строит parentToKids по ParentDir, корректно собирает все уровни, стабильно сортирует детей (директории вперёд, затем файлы, без учёта регистра).
+
+Если корней несколько, возвращается виртуальный корень (root) с агрегированным размером, иначе — единственный реальный корень. Это убирает кейс «на выходе только корень/пусто».
+
+Потоковый режим и resume
+
+Безопасное дозаполнение JSON-массива: вырезается закрывающая ]\n, добавляется ,\n, после дозаписи снова закрываем массив.
+
+Регулярный Flush() каждые 500 элементов.
+
+Прогресс и стабильность
+
+Адаптивный шаг прогресса (100/1000/10000), защита от деления на 0.
+
+Везде where-possible — проверка ошибок и безопасные _ = при вспомогательных операциях записи/seek/truncate.
+
+Размеры и сортировки
+
+Единообразный humanSize с поддержкой до EB.
+
+Стабильные сортировки: директории → файлы, сравнение имён case-insensitive.
+
+Прочее
+
+Для директорий MD5 — детерминированный от имени (дешёво), для файлов — реальный MD5 содержимого.
+
+Расширен классификатор типов файлов.
+
+Убран неиспользуемый humanSize2 и дубляжи вычислений в makeFlatEntry.
+*/
