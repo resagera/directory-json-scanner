@@ -39,18 +39,19 @@ type FileInfo struct {
 }
 
 var (
-	dirFlag       = flag.String("dir", ".", "Директория для сканирования")
-	excludeFlag   = flag.String("exclude", "", "Исключения через запятую")
-	outputFlag    = flag.String("output", "structure.json", "Выходной JSON-файл")
-	prettyFlag    = flag.Bool("pretty", false, "Форматировать JSON красиво")
-	streamFlag    = flag.Bool("stream", false, "Потоковая запись в temp")
-	resumeFlag    = flag.Bool("resume", false, "Продолжить сканирование (только с --stream)")
-	mergeFlag     = flag.String("merge", "", "Список JSON-файлов через запятую для объединения")
-	workersFlag   = flag.Int("workers", runtime.NumCPU(), "Количество параллельных потоков сканирования")
-	skipMd5Flag   = flag.Bool("no-md5", false, "Не вычислять MD5 для файлов")
-	ioLimitFlag   = flag.Int("io-limit", 16, "Максимум одновременных I/O операций (чтение/MD5/Stat)")
-	dedupeFlag    = flag.Bool("dedupe", false, "Удалять дубликаты по FullPathOrig при объединении JSON файлов")
-	mergeFlatFlag = flag.Bool("merge-flat", false, "Сохранять объединённый результат в плоском виде ([]FileInfo) вместо иерархического дерева")
+	dirFlag           = flag.String("dir", ".", "Директория для сканирования")
+	excludeFlag       = flag.String("exclude", "", "Исключения через запятую")
+	outputFlag        = flag.String("output", "structure.json", "Выходной JSON-файл")
+	prettyFlag        = flag.Bool("pretty", false, "Форматировать JSON красиво")
+	streamFlag        = flag.Bool("stream", false, "Потоковая запись в temp")
+	resumeFlag        = flag.Bool("resume", false, "Продолжить сканирование (только с --stream)")
+	mergeFlag         = flag.String("merge", "", "Список JSON-файлов через запятую для объединения")
+	workersFlag       = flag.Int("workers", runtime.NumCPU(), "Количество параллельных потоков сканирования")
+	skipMd5Flag       = flag.Bool("no-md5", false, "Не вычислять MD5 для файлов")
+	ioLimitFlag       = flag.Int("io-limit", 16, "Максимум одновременных I/O операций (чтение/MD5/Stat)")
+	dedupeFlag        = flag.Bool("dedupe", false, "Удалять дубликаты по FullPathOrig при объединении JSON файлов")
+	mergeFlatFlag     = flag.Bool("merge-flat", false, "Сохранять объединённый результат в плоском виде ([]FileInfo) вместо иерархического дерева")
+	mergeChildrenFlag = flag.Bool("merge-children", false, "Объединять только дочерние элементы корней с пересечением по именам директорий")
 )
 
 var (
@@ -102,12 +103,18 @@ func main() {
 	}
 }
 
-// --- Merge Mode ---
+// --- Merge Mode (фикс: строгий приоритет --merge-children, атомарная запись, диагностика) ---
 func mergeMode() {
 	files := strings.Split(*mergeFlag, ",")
 	fmt.Printf("🔗 Объединение %d файлов...\n", len(files))
 
+	// flat-коллекция для стандартной сборки
 	all := make([]FileInfo, 0, 10000)
+
+	// корни для --merge-children
+	roots := make([]FileInfo, 0, len(files))
+
+	// опциональный dedupe
 	var seen map[string]struct{}
 	if *dedupeFlag {
 		seen = make(map[string]struct{})
@@ -121,7 +128,6 @@ func mergeMode() {
 		if file == "" {
 			continue
 		}
-
 		fmt.Printf("📥 Чтение %s...\n", file)
 		data, err := os.ReadFile(file)
 		if err != nil {
@@ -131,55 +137,252 @@ func mergeMode() {
 
 		var parsedFlat []FileInfo
 		var parsedTree FileInfo
-		flatParsed := false
+		asFlat := false
+		asTree := false
 
-		// Сначала пробуем flat JSON ([]FileInfo)
-		if err := json.Unmarshal(data, &parsedFlat); err == nil {
-			if len(parsedFlat) > 0 {
-				all = appendFlatUnique(all, parsedFlat, seen)
-				fmt.Printf("📄 %s: flat-массив (%d элементов)\n", file, len(parsedFlat))
-				continue
-			}
-		}
-
-		// Иначе пробуем иерархическую структуру (FileInfo)
-		if err := json.Unmarshal(data, &parsedTree); err == nil {
-			if parsedTree.FullName != "" || len(parsedTree.Children) > 0 {
-				treeFlat := flattenTree(parsedTree)
-				all = appendFlatUnique(all, treeFlat, seen)
-				fmt.Printf("🌲 %s: дерево -> %d элементов\n", file, len(treeFlat))
-				flatParsed = true
-			}
-		}
-
-		if !flatParsed && len(parsedFlat) == 0 {
-			fmt.Printf("⚠️ %s: не удалось определить формат JSON\n", file)
+		// Пробуем flat ([]FileInfo)
+		if err := json.Unmarshal(data, &parsedFlat); err == nil && len(parsedFlat) > 0 {
+			asFlat = true
+			fmt.Printf("📄 %s: flat-массив (%d элементов)\n", file, len(parsedFlat))
+			all = appendFlatUnique(all, parsedFlat, seen)
+			// Для merge-children нужен корень → собираем временный корень из flat
+			tmpRoot := assembleNestedFromFlat(parsedFlat)
+			roots = append(roots, tmpRoot)
 			continue
+		}
+
+		// Пробуем дерево (FileInfo)
+		if err := json.Unmarshal(data, &parsedTree); err == nil && (parsedTree.FullName != "" || len(parsedTree.Children) > 0) {
+			asTree = true
+			fmt.Printf("🌲 %s: дерево -> %d элементов\n", file, len(parsedTree.Children))
+			all = appendFlatUnique(all, flattenTree(parsedTree), seen)
+			roots = append(roots, parsedTree)
+			continue
+		}
+
+		if !asFlat && !asTree {
+			fmt.Printf("⚠️ %s: не удалось определить формат JSON\n", file)
 		}
 	}
 
-	if len(all) == 0 {
+	if len(all) == 0 && len(roots) == 0 {
 		fmt.Println("⚠️ Нет данных для объединения — проверьте входные JSON-файлы.")
 		return
 	}
 
-	fmt.Printf("📦 Всего элементов после объединения: %d\n", len(all))
+	// === ЖЁСТКИЙ приоритет: --merge-children ===
+	if *mergeChildrenFlag {
+		fmt.Println("🧩 Режим: объединение дочерних элементов корней (--merge-children)")
+		// Даже если передан --merge-flat — игнорируем его тут
+		root := mergeRootChildren(roots)
+		computeDirSizes(&root)
+		recountChildCounts(&root)
+		writeFinalJSONAtomic(*outputFlag, root, *prettyFlag)
+		diagnoseJSONShape(*outputFlag)
+		fmt.Printf("✅ Итоговый корень: %s | %s\n", root.FullName, *outputFlag)
+		return
+	}
 
-	// --- Вывод в зависимости от режима ---
+	// === Обычный merge: либо flat, либо иерархия ===
 	if *mergeFlatFlag {
 		fmt.Println("📤 Сохранение в формате flat ([]FileInfo)")
-		writeFlatJSON(*outputFlag, all, *prettyFlag)
+		writeFlatJSONAtomic(*outputFlag, all, *prettyFlag)
+		diagnoseJSONShape(*outputFlag)
 		fmt.Printf("✅ Объединение завершено. Итоговый файл: %s\n", *outputFlag)
 		return
 	}
 
-	// --- Иерархический вывод ---
 	fmt.Println("📤 Сборка иерархического дерева...")
 	root := assembleNestedFromFlat(all)
 	computeDirSizes(&root)
 	recountChildCounts(&root)
-	writeFinalJSON(*outputFlag, root, *prettyFlag)
+	writeFinalJSONAtomic(*outputFlag, root, *prettyFlag)
+	diagnoseJSONShape(*outputFlag)
 	fmt.Printf("✅ Объединение завершено. Итоговый файл: %s\n", *outputFlag)
+}
+
+// Атомарная запись объекта (дерева)
+func writeFinalJSONAtomic(output string, root FileInfo, pretty bool) {
+	tmp := output + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Ошибка создания временного файла:", err)
+		return
+	}
+	enc := json.NewEncoder(f)
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
+	if err := enc.Encode(root); err != nil {
+		_ = f.Close()
+		fmt.Println("Ошибка записи JSON:", err)
+		_ = os.Remove(tmp)
+		return
+	}
+	_ = f.Close()
+	_ = os.Rename(tmp, output)
+}
+
+// Атомарная запись flat-массива
+func writeFlatJSONAtomic(output string, arr []FileInfo, pretty bool) {
+	tmp := output + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Ошибка создания временного файла:", err)
+		return
+	}
+	enc := json.NewEncoder(f)
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
+	if err := enc.Encode(arr); err != nil {
+		_ = f.Close()
+		fmt.Println("Ошибка записи JSON:", err)
+		_ = os.Remove(tmp)
+		return
+	}
+	_ = f.Close()
+	_ = os.Rename(tmp, output)
+}
+
+// Диагностика формата результата (показывает, что в файле — объект или массив)
+func diagnoseJSONShape(path string) {
+	b := make([]byte, 1)
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Printf("🔎 diagnose: не удалось открыть %s: %v\n", path, err)
+		return
+	}
+	defer f.Close()
+	// Пропускаем пробелы/переводы
+	for {
+		_, err = f.Read(b)
+		if err != nil {
+			fmt.Printf("🔎 diagnose: пустой файл?\n")
+			return
+		}
+		if b[0] != ' ' && b[0] != '\n' && b[0] != '\t' && b[0] != '\r' {
+			break
+		}
+	}
+	switch b[0] {
+	case '{':
+		fmt.Println("🔎 diagnose: итог — OBJECT (дерево)")
+	case '[':
+		fmt.Println("🔎 diagnose: итог — ARRAY (flat)")
+	default:
+		fmt.Printf("🔎 diagnose: неожиданный первый байт: %q\n", b[0])
+	}
+}
+
+// mergeRootChildren объединяет содержимое корней разных файлов в один общий корень.
+// Каталоги с одинаковыми именами всегда объединяются.
+// Файлы с одинаковыми именами добавляются как дубликаты, если dedupe=false.
+func mergeRootChildren(roots []FileInfo) FileInfo {
+	if len(roots) == 0 {
+		return FileInfo{}
+	}
+	if len(roots) == 1 {
+		return roots[0]
+	}
+
+	var names []string
+	for _, r := range roots {
+		if r.FullName != "" {
+			names = append(names, r.FullName)
+		}
+	}
+	rootName := strings.Join(names, "+")
+
+	dedupe := *dedupeFlag
+	childMap := make(map[string]*FileInfo)
+	children := make([]FileInfo, 0)
+
+	for _, r := range roots {
+		for _, ch := range r.Children {
+			existing, exists := childMap[ch.FullName]
+			if exists && ch.IsDir && existing.IsDir {
+				// ✅ директории с одинаковыми именами объединяются всегда
+				merged := mergeDirectories(*existing, ch, dedupe)
+				*existing = merged
+			} else if exists && !ch.IsDir && dedupe {
+				// ✅ дубликат файла при dedupe=true игнорируется
+				continue
+			} else {
+				// ✅ файл (или уникальное имя)
+				c := ch
+				children = append(children, c)
+				if c.IsDir {
+					childMap[c.FullName] = &c
+				} else if dedupe {
+					childMap[c.FullName] = &c
+				}
+			}
+		}
+	}
+
+	// формируем итоговый корень
+	result := FileInfo{
+		IsDir:      true,
+		FullName:   rootName,
+		NameOnly:   rootName,
+		FullPath:   rootName,
+		FileType:   "merged",
+		Children:   children,
+		ChildCount: len(children),
+	}
+
+	// пересчёт размера
+	var total int64
+	for _, c := range children {
+		total += c.SizeBytes
+	}
+	result.SizeBytes = total
+	result.SizeHuman = humanSize(total)
+
+	sort.Slice(result.Children, func(i, j int) bool {
+		return strings.ToLower(result.Children[i].FullName) < strings.ToLower(result.Children[j].FullName)
+	})
+
+	return result
+}
+
+// mergeDirectories рекурсивно объединяет директории по имени.
+// Каталоги всегда объединяются; файлы с одинаковыми именами — только если dedupe=true.
+func mergeDirectories(a, b FileInfo, dedupe bool) FileInfo {
+	dir := a
+	childMap := make(map[string]*FileInfo)
+
+	for i := range dir.Children {
+		child := &dir.Children[i]
+		childMap[child.FullName] = child
+	}
+
+	for _, ch := range b.Children {
+		if existing, ok := childMap[ch.FullName]; ok && ch.IsDir && existing.IsDir {
+			// ✅ директории с одинаковыми именами объединяются всегда
+			merged := mergeDirectories(*existing, ch, dedupe)
+			*existing = merged
+		} else if ok && !ch.IsDir && dedupe {
+			// ✅ дубликат файла пропускаем при dedupe=true
+			continue
+		} else {
+			// ✅ добавляем элемент (файл или уникальную директорию)
+			c := ch
+			dir.Children = append(dir.Children, c)
+			childMap[c.FullName] = &dir.Children[len(dir.Children)-1]
+		}
+	}
+
+	// пересчёт размера и количества
+	var total int64
+	for _, c := range dir.Children {
+		total += c.SizeBytes
+	}
+	dir.SizeBytes = total
+	dir.SizeHuman = humanSize(total)
+	dir.ChildCount = len(dir.Children)
+	return dir
 }
 
 // appendFlatUnique добавляет элементы с опциональным dedupe
