@@ -48,6 +48,7 @@ var (
 	mergeFlag   = flag.String("merge", "", "Список JSON-файлов через запятую для объединения")
 	workersFlag = flag.Int("workers", runtime.NumCPU(), "Количество параллельных потоков сканирования")
 	skipMd5Flag = flag.Bool("no-md5", false, "Не вычислять MD5 для файлов")
+	ioLimitFlag = flag.Int("io-limit", 16, "Максимум одновременных I/O операций (чтение/MD5/Stat)")
 )
 
 var (
@@ -59,6 +60,8 @@ var (
 	logFile          *os.File
 	streamWriter     *bufio.Writer
 	streamFileHandle *os.File
+
+	ioSem chan struct{} // 👈 семафор для ограничения I/O
 )
 
 func main() {
@@ -70,6 +73,9 @@ func main() {
 			_ = logFile.Close()
 		}
 	}()
+
+	// инициализация семафора
+	ioSem = make(chan struct{}, *ioLimitFlag)
 
 	if *excludeFlag != "" {
 		for _, e := range strings.Split(*excludeFlag, ",") {
@@ -122,12 +128,12 @@ func mergeMode() {
 	fmt.Println("✅ Объединение завершено.")
 }
 
-// --- Основной потоковый параллельный режим ---
+// --- Worker pool с потоковой записью ---
 func processParallelStream() {
 	rootAbs, _ := filepath.Abs(*dirFlag)
 	fmt.Printf("📁 Параллельное сканирование с потоком: %s\n", rootAbs)
+	fmt.Printf("⚙️  Workers: %d | I/O limit: %d | MD5: %v\n", *workersFlag, *ioLimitFlag, !*skipMd5Flag)
 
-	// создаём временный поток
 	f, err := os.OpenFile(streamTempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Fatal(err)
@@ -140,35 +146,35 @@ func processParallelStream() {
 	results := make(chan FileInfo, *workersFlag*4)
 	var wg sync.WaitGroup
 
-	// --- Воркеры ---
 	for i := 0; i < *workersFlag; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
-				info, err := os.Stat(path)
-				if err != nil {
-					continue
+				entry := withIOLimit(func() FileInfo {
+					info, err := os.Stat(path)
+					if err != nil {
+						return FileInfo{}
+					}
+					if shouldExclude(path) {
+						return FileInfo{}
+					}
+					return processPath(path, info)
+				})
+				if entry.FullName != "" {
+					results <- entry
 				}
-				if shouldExclude(path) {
-					continue
-				}
-				entry := processPath(path, info)
-				results <- entry
 			}
 		}()
 	}
 
-	// --- Writer горутина ---
+	// writer горутина
 	var writerWG sync.WaitGroup
 	writerWG.Add(1)
 	go func() {
 		defer writerWG.Done()
 		first := true
 		for r := range results {
-			if r.FullName == "" {
-				continue
-			}
 			b, _ := json.Marshal(r)
 			if !first {
 				streamWriter.WriteString(",\n")
@@ -183,7 +189,6 @@ func processParallelStream() {
 		}
 	}()
 
-	// --- Отправка заданий ---
 	go func() {
 		defer close(jobs)
 		filepath.WalkDir(*dirFlag, func(path string, d os.DirEntry, err error) error {
@@ -194,7 +199,6 @@ func processParallelStream() {
 		})
 	}()
 
-	// --- Завершаем ---
 	wg.Wait()
 	close(results)
 	writerWG.Wait()
@@ -285,6 +289,7 @@ func processParallel() {
 }
 
 // --- Обработка пути ---
+// --- processPath теперь использует семафор при работе с ReadDir/MD5 ---
 func processPath(path string, info os.FileInfo) FileInfo {
 	parent := filepath.Dir(path)
 	if parent == "." {
@@ -312,14 +317,20 @@ func processPath(path string, info os.FileInfo) FileInfo {
 	}
 
 	if info.IsDir() {
-		entries, _ := os.ReadDir(path)
+		entries := withIOLimit(func() []os.DirEntry {
+			list, _ := os.ReadDir(path)
+			return list
+		})
 		entry.ChildCount = len(entries)
 		if !*skipMd5Flag {
 			entry.Md5 = md5String(info.Name())
 		}
 	} else if !*skipMd5Flag {
-		entry.Md5 = fileMD5(path)
+		entry.Md5 = withIOLimit(func() string {
+			return fileMD5(path)
+		})
 	}
+
 	return entry
 }
 
@@ -339,15 +350,27 @@ func md5String(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// --- fileMD5 теперь использует withIOLimit ---
 func fileMD5(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	h := md5.New()
-	io.Copy(h, f)
-	return hex.EncodeToString(h.Sum(nil))
+	return withIOLimit(func() string {
+		f, err := os.Open(path)
+		if err != nil {
+			return ""
+		}
+		defer f.Close()
+		h := md5.New()
+		io.Copy(h, f)
+		return hex.EncodeToString(h.Sum(nil))
+	})
+}
+
+// --- I/O limiter helpers ---
+func acquireIO() { ioSem <- struct{}{} }
+func releaseIO() { <-ioSem }
+func withIOLimit[T any](fn func() T) T {
+	acquireIO()
+	defer releaseIO()
+	return fn()
 }
 
 func detectFileType(name string) string {
