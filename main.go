@@ -1,323 +1,311 @@
+// main.go
 package main
 
 import (
+	"bufio"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type FileInfo struct {
-	IsDir        bool      `json:"IsDir"`
-	FullName     string    `json:"FullName"`
-	Ext          string    `json:"Ext"`
-	NameOnly     string    `json:"NameOnly"`
-	SizeBytes    int64     `json:"SizeBytes"`
-	SizeHuman    string    `json:"SizeHuman"`
-	FullPath     string    `json:"FullPath"`
-	FullPathOrig string    `json:"FullPathOrig"`
-	Created      time.Time `json:"Created"`
-	Updated      time.Time `json:"Updated"`
-	Perm         string    `json:"Perm"`
-	Md5          string    `json:"Md5"`
-	FileType     string    `json:"FileType"`
+	IsDir        bool       `json:"IsDir"`
+	FullName     string     `json:"FullName"`
+	Ext          string     `json:"Ext"`
+	NameOnly     string     `json:"NameOnly"`
+	SizeBytes    int64      `json:"SizeBytes"`
+	SizeHuman    string     `json:"SizeHuman"`
+	FullPath     string     `json:"FullPath"`
+	FullPathOrig string     `json:"FullPathOrig"`
+	Created      time.Time  `json:"Created"`
+	Updated      time.Time  `json:"Updated"`
+	Perm         string     `json:"Perm"`
+	Md5          string     `json:"Md5"`
+	FileType     string     `json:"FileType"`
+	Children     []FileInfo `json:"Children,omitempty"`
 }
 
 var (
 	dirFlag     = flag.String("dir", ".", "Директория для сканирования")
-	excludeFlag = flag.String("exclude", "", "Список исключений через запятую (файлы или папки)")
-	outputFlag  = flag.String("output", "result.json", "Имя выходного JSON файла")
+	excludeFlag = flag.String("exclude", "", "Исключения через запятую")
+	outputFlag  = flag.String("output", "structure.json", "Выходной JSON-файл")
 	prettyFlag  = flag.Bool("pretty", false, "Форматировать JSON красиво")
-	streamFlag  = flag.Bool("stream", false, "Потоковая запись элементов в temp-файл")
-	mergeFlag   = flag.String("merge", "", "Список JSON файлов через запятую для объединения (в этом режиме сканирование не выполняется)")
+	streamFlag  = flag.Bool("stream", false, "Потоковая запись в temp")
+	resumeFlag  = flag.Bool("resume", false, "Продолжить сканирование (только с --stream)")
+	mergeFlag   = flag.String("merge", "", "Список JSON-файлов через запятую для объединения")
 )
 
 var (
-	excluded   []string
-	startTime  time.Time
-	count      int64
-	totalSize  int64
-	mutex      sync.Mutex
-	logFile    *os.File
-	logger     *log.Logger
-	lastReport int64 = 100
+	excludeList      []string
+	streamTempName   string
+	existingPaths    map[string]struct{}
+	filesProcessed   int64
+	startTime        time.Time
+	logger           *log.Logger
+	logFile          *os.File
+	streamWriter     *bufio.Writer
+	streamFileHandle *os.File
 )
 
 func main() {
 	flag.Parse()
 	startTime = time.Now()
+	initLogger()
 
-	initLog()
+	if *excludeFlag != "" {
+		for _, e := range strings.Split(*excludeFlag, ",") {
+			e = strings.TrimSpace(e)
+			if e != "" {
+				excludeList = append(excludeList, strings.ToLower(e))
+			}
+		}
+	}
 
-	// --- Новый режим объединения JSON-файлов ---
+	streamTempName = strings.TrimSuffix(*outputFlag, ".json") + "_temp.json"
+
+	// режим объединения
 	if *mergeFlag != "" {
-		files := strings.Split(*mergeFlag, ",")
-		fmt.Printf("🔗 Объединение %d JSON файлов...\n", len(files))
-		logger.Printf("Начато объединение %d файлов", len(files))
-		mergeJSONFiles(files, *outputFlag)
-		fmt.Printf("✅ Объединённый файл сохранён в: %s\n", absPath(*outputFlag))
+		mergeMode()
 		return
 	}
 
-	// --- Обычный режим сканирования ---
-	excluded = strings.Split(*excludeFlag, ",")
-	fmt.Printf("📁 Сканирование директории: %s\n", *dirFlag)
-	fmt.Printf("📄 Выходной файл: %s\n", absPath(*outputFlag))
-
 	if *streamFlag {
-		processStreamed()
-	} else {
-		processNormal()
+		if *resumeFlag {
+			existingPaths = loadExistingTempFlatList(streamTempName)
+			fmt.Printf("🔁 Режим resume: найдено %d уже обработанных файлов\n", len(existingPaths))
+		}
+
+		var err error
+		streamFileHandle, err = os.OpenFile(streamTempName, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			log.Fatalf("Ошибка открытия temp файла: %v", err)
+		}
+		if *resumeFlag && len(existingPaths) > 0 {
+			appendToExistingJSON(streamFileHandle)
+		} else {
+			streamFileHandle.Truncate(0)
+			streamFileHandle.Seek(0, 0)
+			streamFileHandle.WriteString("[\n")
+		}
+		streamWriter = bufio.NewWriter(streamFileHandle)
 	}
 
-	fmt.Println("✅ Готово!")
-	logger.Println("✅ Готово!")
-}
-
-func processStreamed() {
-	tempFile := strings.TrimSuffix(*outputFlag, ".json") + "_temp.json"
-	f, err := os.Create(tempFile)
-	if err != nil {
-		log.Fatalf("Ошибка создания temp файла: %v", err)
-	}
-	defer f.Close()
-
-	f.WriteString("[\n")
-
-	first := true
-	fileChan := make(chan *FileInfo, 100)
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := filepath.Walk(*dirFlag, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if shouldExclude(path) {
+	fmt.Printf("📁 Начало сканирования: %s\n", *dirFlag)
+	err := filepath.Walk(*dirFlag, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		//fmt.Println("SCAN:", path)
+		if shouldExclude(path, info) {
+			if info.IsDir() {
 				return filepath.SkipDir
 			}
-
-			fi := buildFileInfo(path, info)
-			fileChan <- fi
-			updateProgress()
-			return nil
-		})
-		if err != nil {
-			log.Println("Ошибка обхода:", err)
-		}
-		close(fileChan)
-	}()
-
-	for fi := range fileChan {
-		data, _ := json.Marshal(fi)
-		if !first {
-			f.WriteString(",\n")
-		}
-		first = false
-		f.Write(data)
-	}
-	wg.Wait()
-	f.WriteString("\n]")
-
-	fmt.Printf("🔧 Сборка итогового файла %s...\n", *outputFlag)
-	assembleFinalFile(tempFile, *outputFlag)
-	os.Remove(tempFile)
-}
-
-func assembleFinalFile(tempPath, finalPath string) {
-	input, err := os.ReadFile(tempPath)
-	if err != nil {
-		log.Fatalf("Ошибка чтения temp файла: %v", err)
-	}
-
-	var arr []FileInfo
-	if err := json.Unmarshal(input, &arr); err != nil {
-		log.Fatalf("Ошибка при разборе temp файла: %v", err)
-	}
-
-	writeJSON(finalPath, arr)
-}
-
-func processNormal() {
-	var files []FileInfo
-
-	filepath.Walk(*dirFlag, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
 			return nil
 		}
-		if shouldExclude(path) {
-			return filepath.SkipDir
+		abs, _ := filepath.Abs(path)
+		entry := makeFlatEntry(abs, info)
+
+		if *streamFlag {
+			// потоковый режим
+			b, _ := json.Marshal(entry)
+			if atomic.LoadInt64(&filesProcessed) > 0 {
+				streamWriter.WriteString(",\n")
+			}
+			streamWriter.Write(b)
 		}
 
-		fi := buildFileInfo(path, info)
-		files = append(files, *fi)
-		updateProgress()
+		// 🔧 добавь эту строку ↓
+		atomic.AddInt64(&filesProcessed, 1)
+
+		printProgress()
 		return nil
 	})
+	if err != nil {
+		log.Printf("Ошибка обхода: %v", err)
+	}
 
-	writeJSON(*outputFlag, files)
+	if *streamFlag {
+		streamWriter.WriteString("\n]\n")
+		streamWriter.Flush()
+		streamFileHandle.Close()
+		fmt.Printf("✅ Записан temp: %s\n", streamTempName)
+		logger.Printf("Temp file saved: %s", streamTempName)
+
+		flat, err := readFlatArrayFromFile(streamTempName)
+		if err != nil {
+			log.Fatalf("Ошибка чтения temp: %v", err)
+		}
+		root := assembleNestedFromFlat(flat)
+		writeFinalJSON(*outputFlag, root, *prettyFlag)
+		fmt.Printf("🎉 Результат собран: %s\n", *outputFlag)
+	}
+	logger.Printf("Готово.")
 }
 
-func mergeJSONFiles(inputs []string, output string) {
-	var merged []FileInfo
-
-	for _, file := range inputs {
+func mergeMode() {
+	files := strings.Split(*mergeFlag, ",")
+	fmt.Printf("🔗 Объединение %d файлов...\n", len(files))
+	all := []FileInfo{}
+	for _, file := range files {
 		file = strings.TrimSpace(file)
-		fmt.Printf("📖 Чтение: %s\n", file)
 		data, err := os.ReadFile(file)
 		if err != nil {
-			log.Printf("Ошибка чтения %s: %v\n", file, err)
+			fmt.Printf("Ошибка чтения %s: %v\n", file, err)
 			continue
 		}
-		var arr []FileInfo
-		if err := json.Unmarshal(data, &arr); err != nil {
-			log.Printf("Ошибка парсинга %s: %v\n", file, err)
+		var flat []FileInfo
+		if err := json.Unmarshal(data, &flat); err != nil {
+			fmt.Printf("Ошибка парсинга %s: %v\n", file, err)
 			continue
 		}
-		merged = append(merged, arr...)
-		fmt.Printf("  ➕ Добавлено %d элементов (всего %d)\n", len(arr), len(merged))
+		all = append(all, flat...)
 	}
-
-	writeJSON(output, merged)
-	logger.Printf("Успешно объединено %d файлов", len(inputs))
+	root := assembleNestedFromFlat(all)
+	writeFinalJSON(*outputFlag, root, *prettyFlag)
+	fmt.Println("✅ Объединение завершено.")
 }
 
-func writeJSON(file string, data interface{}) {
-	out, err := os.Create(file)
-	if err != nil {
-		log.Fatalf("Ошибка создания JSON файла: %v", err)
-	}
-	defer out.Close()
-
-	var encoded []byte
-	if *prettyFlag {
-		encoded, err = json.MarshalIndent(data, "", "  ")
-	} else {
-		encoded, err = json.Marshal(data)
-	}
-	if err != nil {
-		log.Fatalf("Ошибка кодирования JSON: %v", err)
-	}
-	out.Write(encoded)
-	fmt.Printf("💾 JSON сохранен: %s\n", absPath(file))
+func initLogger() {
+	logFile, _ = os.Create("scan.log")
+	logger = log.New(logFile, "", log.LstdFlags)
 }
 
-func buildFileInfo(path string, info os.FileInfo) *FileInfo {
-	size := getSize(path)
-	totalSize += size
+func loadExistingTempFlatList(tempPath string) map[string]struct{} {
+	data, err := os.ReadFile(tempPath)
+	if err != nil {
+		return map[string]struct{}{}
+	}
+	var arr []FileInfo
+	if err := json.Unmarshal(data, &arr); err != nil {
+		fmt.Printf("⚠️ Ошибка чтения temp, начнем заново: %v\n", err)
+		return map[string]struct{}{}
+	}
+	m := make(map[string]struct{}, len(arr))
+	for _, f := range arr {
+		m[f.FullPathOrig] = struct{}{}
+	}
+	return m
+}
 
-	md5sum := ""
+func appendToExistingJSON(f *os.File) {
+	stat, _ := f.Stat()
+	if stat.Size() < 3 {
+		return
+	}
+	offset := stat.Size() - 2
+	f.Seek(offset, 0)
+	f.Truncate(offset)
+	f.WriteString(",\n")
+}
+
+func readFlatArrayFromFile(path string) ([]FileInfo, error) {
+	var arr []FileInfo
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return nil, err
+	}
+	return arr, nil
+}
+
+// --- Вложенная сборка ---
+func assembleNestedFromFlat(flat []FileInfo) FileInfo {
+	nodes := map[string]*FileInfo{}
+	var root FileInfo
+	for _, f := range flat {
+		p := filepath.Clean(f.FullPathOrig)
+		nodes[p] = &f
+	}
+
+	for _, f := range flat {
+		if f.IsDir {
+			continue
+		}
+		dir := filepath.Dir(f.FullPathOrig)
+		for dir != "" {
+			parent, ok := nodes[dir]
+			if !ok {
+				parent = &FileInfo{
+					IsDir:        true,
+					FullName:     filepath.Base(dir),
+					NameOnly:     filepath.Base(dir),
+					FullPath:     dir,
+					FullPathOrig: dir,
+				}
+				nodes[dir] = parent
+			}
+			parent.Children = append(parent.Children, f)
+			dir = filepath.Dir(dir)
+			if dir == "." || dir == "/" {
+				break
+			}
+		}
+	}
+
+	for _, v := range nodes {
+		if filepath.Dir(v.FullPathOrig) == "." {
+			root.Children = append(root.Children, *v)
+		}
+	}
+	return root
+}
+
+// --- Вспомогательные функции ---
+func makeFlatEntry(path string, info os.FileInfo) FileInfo {
+	size := int64(0)
 	if !info.IsDir() {
-		md5sum = calcMD5(path)
+		size = info.Size()
 	}
-
-	fileType := detectType(path)
-	created := info.ModTime()
-	updated := info.ModTime()
-
-	return &FileInfo{
+	return FileInfo{
 		IsDir:        info.IsDir(),
 		FullName:     info.Name(),
-		Ext:          strings.ToLower(filepath.Ext(info.Name())),
+		Ext:          strings.TrimPrefix(filepath.Ext(info.Name()), "."),
 		NameOnly:     strings.TrimSuffix(info.Name(), filepath.Ext(info.Name())),
 		SizeBytes:    size,
 		SizeHuman:    humanSize(size),
 		FullPath:     path,
 		FullPathOrig: path,
-		Created:      created,
-		Updated:      updated,
+		Created:      info.ModTime(),
+		Updated:      info.ModTime(),
 		Perm:         info.Mode().String(),
-		Md5:          md5sum,
-		FileType:     fileType,
+		Md5:          md5String(info.Name()),
+		FileType:     detectFileType(info.Name()),
 	}
 }
 
-func updateProgress() {
-	mutex.Lock()
-	defer mutex.Unlock()
-	count++
-	if count >= lastReport {
-		elapsed := time.Since(startTime).Seconds()
-		speed := float64(count) / elapsed
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		fmt.Printf("📊 %d файлов | %s прошло | %.2f MB | скорость %.1f ф/с\n",
-			count, time.Since(startTime).Truncate(time.Second), float64(m.Alloc)/1024/1024, speed)
-		logger.Printf("%d файлов, %.1f MB, %.1f ф/с\n", count, float64(m.Alloc)/1024/1024, speed)
-
-		switch {
-		case count < 1000:
-			lastReport += 100
-		case count < 10000:
-			lastReport += 1000
-		default:
-			lastReport += 10000
-		}
-	}
+func md5String(s string) string {
+	h := md5.Sum([]byte(s))
+	return hex.EncodeToString(h[:])
 }
 
-func shouldExclude(path string) bool {
-	for _, ex := range excluded {
-		if ex != "" && strings.Contains(path, ex) {
+func shouldExclude(path string, info os.FileInfo) bool {
+	pl := strings.ToLower(path)
+	for _, ex := range excludeList {
+		if strings.Contains(pl, ex) {
 			return true
 		}
 	}
 	return false
 }
 
-func getSize(path string) int64 {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	if !info.IsDir() {
-		return info.Size()
-	}
-	var total int64
-	filepath.Walk(path, func(_ string, inf os.FileInfo, err error) error {
-		if err == nil && !inf.IsDir() {
-			total += inf.Size()
-		}
-		return nil
-	})
-	return total
-}
-
-func calcMD5(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	h := md5.New()
-	_, _ = io.Copy(h, f)
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func detectType(path string) string {
-	ext := strings.ToLower(filepath.Ext(path))
+func detectFileType(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
-	case ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp":
+	case ".jpg", ".jpeg", ".png", ".gif":
 		return "image"
-	case ".mp4", ".avi", ".mkv", ".mov":
+	case ".mp4", ".avi", ".mkv":
 		return "video"
-	case ".mp3", ".wav", ".flac":
-		return "audio"
-	case ".txt", ".md", ".log":
-		return "text"
-	case ".go", ".js", ".py", ".sh", ".json", ".yaml", ".yml":
-		return "code"
 	default:
 		return "other"
 	}
@@ -333,21 +321,43 @@ func humanSize(size int64) string {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %ciB", float64(size)/float64(div), "KMGTPE"[exp])
+	value := float64(size) / float64(div)
+	suffix := []string{"KB", "MB", "GB", "TB"}[exp]
+	return fmt.Sprintf("%.2f %s", value, suffix)
 }
 
-func absPath(path string) string {
-	p, _ := filepath.Abs(path)
-	return p
-}
-
-func initLog() {
-	logFileName := strings.TrimSuffix(*outputFlag, ".json") + ".log"
-	var err error
-	logFile, err = os.Create(logFileName)
-	if err != nil {
-		log.Fatalf("Ошибка создания лог-файла: %v", err)
+func printProgress() {
+	count := atomic.LoadInt64(&filesProcessed)
+	step := int64(100)
+	switch {
+	case count >= 10000:
+		step = 10000
+	case count >= 1000:
+		step = 1000
 	}
-	logger = log.New(logFile, "", log.LstdFlags)
-	fmt.Printf("🧾 Лог файл: %s\n", absPath(logFileName))
+	if count%step != 0 {
+		return
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	elapsed := time.Since(startTime).Seconds()
+	speed := float64(count) / elapsed
+	fmt.Printf("📊 %8d файлов | %6.1fs | %6.1f ф/с | %.1f MB\n",
+		count, elapsed, speed, float64(m.Alloc)/1024.0/1024.0)
+}
+
+func writeFinalJSON(output string, root FileInfo, pretty bool) {
+	f, err := os.Create(output)
+	if err != nil {
+		fmt.Println("Ошибка создания выходного файла:", err)
+		return
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
+	if err := enc.Encode(root); err != nil {
+		fmt.Println("Ошибка записи JSON:", err)
+	}
 }
