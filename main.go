@@ -64,8 +64,15 @@ var (
 	streamWriter     *bufio.Writer
 	streamFileHandle *os.File
 
-	ioSem chan struct{} // 👈 семафор для ограничения I/O
+	ioSem     chan struct{} // 👈 семафор для ограничения I/O
+	workerSem chan struct{}
 )
+
+func withIOLimitValue[T any](fn func() T) T {
+	ioSem <- struct{}{}
+	defer func() { <-ioSem }()
+	return fn()
+}
 
 func main() {
 	flag.Parse()
@@ -449,21 +456,22 @@ func processParallelStream() {
 	results := make(chan FileInfo, *workersFlag*4)
 	var wg sync.WaitGroup
 
+	// 🔹 создаём ioSem только один раз
+	ioSem = make(chan struct{}, *ioLimitFlag)
+
 	for i := 0; i < *workersFlag; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
-				entry := withIOLimit(func() FileInfo {
-					info, err := os.Stat(path)
-					if err != nil {
-						return FileInfo{}
-					}
-					if shouldExclude(path) {
-						return FileInfo{}
-					}
-					return processPath(path, info)
-				})
+				info, err := os.Stat(path)
+				if err != nil {
+					continue
+				}
+				if shouldExclude(path) {
+					continue
+				}
+				entry := processPath(path, info)
 				if entry.FullName != "" {
 					results <- entry
 				}
@@ -471,7 +479,7 @@ func processParallelStream() {
 		}()
 	}
 
-	// writer горутина
+	// 🔹 writer горутина
 	var writerWG sync.WaitGroup
 	writerWG.Add(1)
 	go func() {
@@ -492,6 +500,7 @@ func processParallelStream() {
 		}
 	}()
 
+	// 🔹 producer (WalkDir)
 	go func() {
 		defer close(jobs)
 		filepath.WalkDir(*dirFlag, func(path string, d os.DirEntry, err error) error {
@@ -620,7 +629,7 @@ func processPath(path string, info os.FileInfo) FileInfo {
 	}
 
 	if info.IsDir() {
-		entries := withIOLimit(func() []os.DirEntry {
+		entries := withIOLimitValue(func() []os.DirEntry {
 			list, _ := os.ReadDir(path)
 			return list
 		})
@@ -629,7 +638,7 @@ func processPath(path string, info os.FileInfo) FileInfo {
 			entry.Md5 = md5String(info.Name())
 		}
 	} else if !*skipMd5Flag {
-		entry.Md5 = withIOLimit(func() string {
+		entry.Md5 = withIOLimitValue(func() string {
 			return fileMD5(path)
 		})
 	}
@@ -655,26 +664,25 @@ func md5String(s string) string {
 
 // --- fileMD5 теперь использует withIOLimit ---
 func fileMD5(path string) string {
-	return withIOLimit(func() string {
-		f, err := os.Open(path)
-		if err != nil {
-			return ""
-		}
-		defer f.Close()
-		h := md5.New()
-		io.Copy(h, f)
-		return hex.EncodeToString(h.Sum(nil))
-	})
+	acquireIO()
+	defer releaseIO()
+
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // --- I/O limiter helpers ---
 func acquireIO() { ioSem <- struct{}{} }
 func releaseIO() { <-ioSem }
-func withIOLimit[T any](fn func() T) T {
-	acquireIO()
-	defer releaseIO()
-	return fn()
-}
 
 func detectFileType(name string) string {
 	ext := strings.ToLower(filepath.Ext(name))
