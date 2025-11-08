@@ -1,6 +1,6 @@
 module fsjson
 
-go 1.18
+go 1.22
 
 require github.com/jessevdk/go-flags v1.6.1
 
