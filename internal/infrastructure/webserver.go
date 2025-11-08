@@ -15,6 +15,7 @@ import (
 	"fsjson/internal/config"
 	"fsjson/internal/domain/model"
 	"fsjson/internal/domain/service"
+	httpHandler "fsjson/internal/interface/http"
 )
 
 //go:embed static/*
@@ -68,6 +69,8 @@ func StartWebServer(jsonPath string) {
 		results := service.SearchFiles(&root, params)
 		writeJSON(w, results)
 	})
+
+	http.HandleFunc("/api/duplicates", httpHandler.HandleDuplicates(&root))
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
