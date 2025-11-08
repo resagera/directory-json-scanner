@@ -224,6 +224,31 @@ go test ./internal/domain/service -v -run MergeChildren
 
 ---
 
+## Поиск
+
+
+### Через CLI:
+
+```bash
+./build --file=4tbWdPortable.json --search --query="*.mp4" --type=video --size.gt=100000000
+```
+
+### Через браузер/API:
+
+```
+http://localhost:8080/api/search?query=*.jpg&type=image&size.lt=500000&recursive=true&limit=50
+```
+
+Ответ:
+
+```json
+[
+  {"FullPathOrig":"/photos/2024/summer/img001.jpg","SizeBytes":34211,"FileType":"image"},
+  {"FullPathOrig":"/photos/2024/summer/img002.jpg","SizeBytes":29901,"FileType":"image"}
+]
+```
+
+
 ## 🧾 Лицензия
 
 MIT © 2025 Resager
