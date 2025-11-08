@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"crypto/md5"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -52,6 +54,8 @@ var (
 	dedupeFlag        = flag.Bool("dedupe", false, "Удалять дубликаты по FullPathOrig при объединении JSON файлов")
 	mergeFlatFlag     = flag.Bool("merge-flat", false, "Сохранять объединённый результат в плоском виде ([]FileInfo) вместо иерархического дерева")
 	mergeChildrenFlag = flag.Bool("merge-children", false, "Объединять только дочерние элементы корней с пересечением по именам директорий")
+	webFlag           = flag.Bool("web", false, "Запустить веб-интерфейс для просмотра JSON")
+	fileFlag          = flag.String("file", "", "JSON-файл для просмотра в веб-интерфейсе")
 )
 
 var (
@@ -97,6 +101,14 @@ func main() {
 	}
 
 	streamTempName = strings.TrimSuffix(*outputFlag, ".json") + "_temp.json"
+
+	if *webFlag {
+		if *fileFlag == "" {
+			log.Fatal("Укажите JSON-файл через --file")
+		}
+		startWebServer(*fileFlag)
+		return
+	}
 
 	if *mergeFlag != "" {
 		mergeMode()
@@ -1027,6 +1039,132 @@ func getCreateTime(path string) time.Time {
 	return info.ModTime()
 }
 
+//go:embed static/*
+var staticFS embed.FS
+
+// --- Веб интерфейс ---
+func startWebServer(jsonPath string) {
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		log.Fatalf("Ошибка чтения %s: %v", jsonPath, err)
+	}
+
+	var root FileInfo
+	if err := json.Unmarshal(data, &root); err != nil {
+		log.Fatalf("Ошибка разбора JSON: %v", err)
+	}
+
+	fmt.Printf("🌐 Веб-интерфейс запущен: http://localhost:8080\n📄 Загружен файл: %s\n", jsonPath)
+
+	// API endpoint
+	http.HandleFunc("/api/tree", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" || path == "/" {
+			writeJSON(w, root.Children)
+			return
+		}
+
+		node := findNodeByPath(&root, path)
+		if node == nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		writeJSON(w, node.Children)
+	})
+
+	// статика
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(indexHTML))
+	})
+
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+func findNodeByPath(node *FileInfo, path string) *FileInfo {
+	if node.FullPath == path {
+		return node
+	}
+	for i := range node.Children {
+		if sub := findNodeByPath(&node.Children[i], path); sub != nil {
+			return sub
+		}
+	}
+	return nil
+}
+
+var indexHTML = `
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>File Explorer</title>
+<style>
+body { font-family: sans-serif; margin: 0; background: #fafafa; }
+header { background: #333; color: #fff; padding: 8px 16px; font-size: 18px; }
+#tree { padding: 10px 20px; font-family: monospace; }
+.item { cursor: pointer; margin-left: 20px; }
+.folder::before { content: "📁 "; }
+.file::before { content: "📄 "; }
+.info { color: #777; margin-left: 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>📁 File Explorer</header>
+<div id="tree"></div>
+
+<script>
+async function fetchTree(path="/") {
+  const res = await fetch("/api/tree?path=" + encodeURIComponent(path));
+  if (!res.ok) return [];
+  return await res.json();
+}
+
+async function render(path="/", container=document.getElementById("tree")) {
+  const items = await fetchTree(path);
+  container.innerHTML = "";
+  for (const item of items) {
+    const div = document.createElement("div");
+    div.className = "item " + (item.IsDir ? "folder" : "file");
+    div.textContent = item.FullName;
+    if (item.IsDir) {
+      div.onclick = () => {
+        history.pushState({ path: item.FullPath }, "", "?path=" + encodeURIComponent(item.FullPath));
+        load(item.FullPath);
+      };
+    } else {
+      const info = document.createElement("span");
+      info.className = "info";
+      info.textContent = ` + "`" + `${item.SizeHuman} | ${item.FileType}` + "`" + `;
+      div.appendChild(info);
+    }
+    container.appendChild(div);
+  }
+}
+
+async function load(path="/") {
+  const tree = document.getElementById("tree");
+  await render(path, tree);
+}
+
+window.onpopstate = () => {
+  const params = new URLSearchParams(location.search);
+  load(params.get("path") || "/");
+};
+
+load(new URLSearchParams(location.search).get("path") || "/");
+</script>
+</body>
+</html>
+`
+
 /*
 Ключевые изменения и исправления:
 
@@ -1076,4 +1214,6 @@ Flat-вывод	--merge-flat	сохраняет как []FileInfo, без дер
 Совместимость	автоматическая	поддерживает и плоские, и древовидные JSON
 Пересчёт ChildCount	всегда	корректное количество детей в каталоге
 Пересчёт SizeBytes и дат	всегда	через computeDirSizes()
+
+./build --web --file=4tb.json
 */
