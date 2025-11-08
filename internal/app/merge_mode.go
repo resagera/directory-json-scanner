@@ -12,16 +12,21 @@ import (
 	"fsjson/internal/infrastructure"
 )
 
-// MergeMode объединяет несколько JSON-файлов (flat или tree)
-func MergeMode(mergeArg string) {
-	files := strings.Split(mergeArg, ",")
-	fmt.Printf("🔗 Объединение %d файлов...\n", len(files))
+func MergeMode(cfg MergeConfig) {
+	fmt.Printf("🔗 Объединение %d файлов...\n", len(cfg.Files))
 
 	all := make([]model.FileInfo, 0, 10000)
-	roots := make([]model.FileInfo, 0, len(files))
-	seen := make(map[string]struct{})
+	roots := make([]model.FileInfo, 0, len(cfg.Files))
 
-	for _, file := range files {
+	var seen map[string]struct{}
+	if cfg.Dedupe {
+		seen = make(map[string]struct{})
+		fmt.Println("⚙️  Включено удаление дубликатов по FullPathOrig")
+	} else {
+		fmt.Println("⚙️  Дубликаты не будут удаляться")
+	}
+
+	for _, file := range cfg.Files {
 		file = strings.TrimSpace(file)
 		if file == "" {
 			continue
@@ -36,22 +41,21 @@ func MergeMode(mergeArg string) {
 		var parsedFlat []model.FileInfo
 		var parsedTree model.FileInfo
 
+		// []FileInfo
 		if err := json.Unmarshal(data, &parsedFlat); err == nil && len(parsedFlat) > 0 {
-			fmt.Printf("📄 %s: flat-массив (%d элементов)\n", file, len(parsedFlat))
-			all = append(all, service.AppendFlatUnique(nil, parsedFlat, seen)...)
+			fmt.Printf("📄 %s: flat (%d)\n", file, len(parsedFlat))
+			all = service.AppendFlatUnique(all, parsedFlat, seen)
 			roots = append(roots, service.AssembleNestedFromFlat(parsedFlat))
 			continue
 		}
-
-		if err := json.Unmarshal(data, &parsedTree); err == nil &&
-			(parsedTree.FullName != "" || len(parsedTree.Children) > 0) {
+		// FileInfo
+		if err := json.Unmarshal(data, &parsedTree); err == nil && (parsedTree.FullName != "" || len(parsedTree.Children) > 0) {
 			fmt.Printf("🌲 %s: дерево (%d детей)\n", file, len(parsedTree.Children))
-			all = append(all, service.FlattenTree(parsedTree)...)
+			all = service.AppendFlatUnique(all, service.FlattenTree(parsedTree), seen)
 			roots = append(roots, parsedTree)
 			continue
 		}
-
-		fmt.Printf("⚠️ %s: не удалось определить формат\n", file)
+		fmt.Printf("⚠️ %s: неизвестный формат\n", file)
 	}
 
 	if len(all) == 0 && len(roots) == 0 {
@@ -59,14 +63,34 @@ func MergeMode(mergeArg string) {
 		return
 	}
 
-	// === Собираем дерево ===
+	// Приоритет: --merge-children
+	if cfg.MergeChildren {
+		fmt.Println("🧩 Режим: объединение дочерних элементов корней (--merge-children)")
+		root := service.MergeRootChildren(roots, cfg.Dedupe)
+		service.ComputeDirSizes(&root)
+		service.RecountChildCounts(&root)
+		infrastructure.WriteFinalJSONAtomic(cfg.Output, root, cfg.Pretty)
+		infrastructure.DiagnoseJSONShape(cfg.Output)
+		fmt.Printf("✅ Итоговый корень: %s | %s\n", root.FullName, cfg.Output)
+		return
+	}
+
+	// Обычная сборка
+	if cfg.MergeFlat {
+		fmt.Println("📤 Сохранение в формате flat ([]FileInfo)")
+		infrastructure.WriteFlatJSONAtomic(cfg.Output, all, cfg.Pretty)
+		infrastructure.DiagnoseJSONShape(cfg.Output)
+		fmt.Printf("✅ Объединение завершено. Итоговый файл: %s\n", cfg.Output)
+		return
+	}
+
 	fmt.Println("📤 Сборка иерархического дерева...")
 	root := service.AssembleNestedFromFlat(all)
 	service.ComputeDirSizes(&root)
 	service.RecountChildCounts(&root)
-	infrastructure.WriteFinalJSONAtomic("merged.json", root, true)
-	infrastructure.DiagnoseJSONShape("merged.json")
-	fmt.Printf("✅ Объединение завершено. Файл: merged.json (%d элементов)\n", len(all))
+	infrastructure.WriteFinalJSONAtomic(cfg.Output, root, cfg.Pretty)
+	infrastructure.DiagnoseJSONShape(cfg.Output)
+	fmt.Printf("✅ Объединение завершено. Итоговый файл: %s\n", cfg.Output)
 }
 
 // --- вспомогательные функции сортировки ---

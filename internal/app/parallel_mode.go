@@ -1,7 +1,6 @@
 package app
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,35 +14,56 @@ import (
 	"fsjson/internal/infrastructure"
 )
 
-// ProcessParallel выполняет обычное параллельное сканирование без потоковой записи
-func ProcessParallel(rootDir string) {
+// ProcessParallel — параллельное сканирование без потоковой записи
+func ProcessParallel(cfg ScanConfig) {
 	start := time.Now()
-	rootAbs, _ := filepath.Abs(rootDir)
+	rootAbs, _ := filepath.Abs(cfg.RootDir)
 	fmt.Printf("📁 Начало сканирования: %s\n", rootAbs)
+	fmt.Printf("⚙️  Workers: %d | I/O limit: %d | MD5: %v | pretty: %v\n",
+		cfg.Workers, cfg.IOLimit, !cfg.SkipMD5, cfg.Pretty)
 
-	numWorkers := runtime.NumCPU()
-	jobs := make(chan string, numWorkers*4)
-	results := make(chan model.FileInfo, numWorkers*4)
+	infrastructure.InitIOLimiter(cfg.IOLimit)
+
+	jobs := make(chan string, cfg.Workers*4)
+	results := make(chan model.FileInfo, cfg.Workers*4)
 	var wg sync.WaitGroup
 	var processed int64
 
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < cfg.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
+				if service.ShouldExclude(path, cfg.Exclude) {
+					continue
+				}
 				fi, err := os.Stat(path)
 				if err != nil {
 					continue
 				}
-				results <- service.ProcessPath(path, fi, false)
+				entry := service.ProcessPathWith(path, fi, cfg.SkipMD5,
+					func(dir string) int {
+						return infrastructure.WithIOLimitValue(func() int {
+							list, _ := os.ReadDir(dir)
+							return len(list)
+						})
+					},
+					func(p string) string {
+						return infrastructure.WithIOLimitValue(func() string {
+							return service.FileMD5(p)
+						})
+					},
+				)
+				if entry.FullName != "" {
+					results <- entry
+				}
 			}
 		}()
 	}
 
 	go func() {
 		defer close(jobs)
-		filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
+		filepath.WalkDir(cfg.RootDir, func(path string, d os.DirEntry, err error) error {
 			if err == nil {
 				jobs <- path
 			}
@@ -68,7 +88,8 @@ func ProcessParallel(rootDir string) {
 
 	root := service.AssembleNestedFromFlat(flat)
 	service.ComputeDirSizes(&root)
-	infrastructure.WriteFinalJSONAtomic("result.json", root, true)
+	infrastructure.WriteFinalJSONAtomic(cfg.Output, root, cfg.Pretty)
+	infrastructure.DiagnoseJSONShape(cfg.Output)
 
 	fmt.Printf("✅ Готово. Файлов: %d | %v\n", processed, time.Since(start))
 }
@@ -79,10 +100,4 @@ func printProgress(n int64) {
 		runtime.ReadMemStats(&m)
 		fmt.Printf("📊 %8d файлов | %.1f MB RAM\n", n, float64(m.Alloc)/1024.0/1024.0)
 	}
-}
-
-// Helper for debugging (optional JSON dump)
-func debugWriteFlatJSON(arr []model.FileInfo) {
-	data, _ := json.MarshalIndent(arr, "", "  ")
-	os.WriteFile("debug_flat.json", data, 0644)
 }

@@ -14,43 +14,17 @@ import (
 )
 
 // ProcessPath анализирует один путь
+// ProcessPath — версия по умолчанию (без внешнего I/O лимита)
 func ProcessPath(path string, info os.FileInfo, skipMd5 bool) model.FileInfo {
-	parent := filepath.Dir(path)
-	if parent == "." {
-		parent = ""
-	}
-	size := int64(0)
-	if !info.IsDir() {
-		size = info.Size()
-	}
-
-	entry := model.FileInfo{
-		IsDir:        info.IsDir(),
-		FullName:     info.Name(),
-		Ext:          strings.TrimPrefix(filepath.Ext(info.Name()), "."),
-		NameOnly:     strings.TrimSuffix(info.Name(), filepath.Ext(info.Name())),
-		SizeBytes:    size,
-		SizeHuman:    HumanSize(size),
-		FullPath:     path,
-		FullPathOrig: path,
-		ParentDir:    parent,
-		Created:      info.ModTime(),
-		Updated:      info.ModTime(),
-		Perm:         info.Mode().String(),
-		FileType:     DetectFileType(info.Name()),
-	}
-
-	if info.IsDir() {
-		list, _ := os.ReadDir(path)
-		entry.ChildCount = len(list)
-		if !skipMd5 {
-			entry.Md5 = Md5String(info.Name())
-		}
-	} else if !skipMd5 {
-		entry.Md5 = FileMD5(path)
-	}
-
-	return entry
+	return ProcessPathWith(path, info, skipMd5,
+		func(dir string) int {
+			list, _ := os.ReadDir(dir)
+			return len(list)
+		},
+		func(p string) string {
+			return FileMD5(p)
+		},
+	)
 }
 
 // AssembleNestedFromFlat собирает дерево из flat-массива
@@ -153,10 +127,69 @@ func ComputeDirSizes(node *model.FileInfo) int64 {
 	return total
 }
 
-// --- Утилиты (переиспользуемые) ---
+// ProcessPathWith — как ProcessPath, но с инъекцией I/O-функций (для лимита)
+func ProcessPathWith(
+	path string,
+	info os.FileInfo,
+	skipMd5 bool,
+	readDirCount func(dir string) int,
+	fileMD5 func(path string) string,
+) model.FileInfo {
+	parent := filepath.Dir(path)
+	if parent == "." {
+		parent = ""
+	}
+
+	size := int64(0)
+	if !info.IsDir() {
+		size = info.Size()
+	}
+
+	entry := model.FileInfo{
+		IsDir:        info.IsDir(),
+		FullName:     info.Name(),
+		Ext:          strings.TrimPrefix(strings.ToLower(filepath.Ext(info.Name())), "."),
+		NameOnly:     strings.TrimSuffix(info.Name(), filepath.Ext(info.Name())),
+		SizeBytes:    size,
+		SizeHuman:    HumanSize(size),
+		FullPath:     path,
+		FullPathOrig: path,
+		ParentDir:    parent,
+		Created:      info.ModTime(),
+		Updated:      info.ModTime(),
+		Perm:         info.Mode().String(),
+		FileType:     DetectFileType(info.Name()),
+	}
+
+	if info.IsDir() {
+		if readDirCount != nil {
+			entry.ChildCount = readDirCount(path)
+		}
+		if !skipMd5 {
+			entry.Md5 = Md5String(info.Name())
+		}
+	} else if !skipMd5 && fileMD5 != nil {
+		entry.Md5 = fileMD5(path)
+	}
+
+	return entry
+}
+
+// ShouldExclude — проверка по подстроке ПОЛНОГО пути (регистронезависимо)
+func ShouldExclude(absPath string, excludes []string) bool {
+	pl := strings.ToLower(absPath)
+	for _, ex := range excludes {
+		if ex != "" && strings.Contains(pl, ex) {
+			return true
+		}
+	}
+	return false
+}
+
+// --- MD5 helpers (чистые, без инфраструктурных зависимостей) ---
 func Md5String(s string) string {
-	h := md5.Sum([]byte(s))
-	return hex.EncodeToString(h[:])
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
 
 func FileMD5(path string) string {
