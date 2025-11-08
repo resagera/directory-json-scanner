@@ -213,7 +213,8 @@ go install ./...
 Для проверки логики объединения (deep merge, dedupe и children merge) предусмотрены тесты:
 
 ```bash
-go test -v
+go test ./internal/domain/service -v
+go test ./internal/domain/service -v -run MergeChildren
 ```
 
 Примеры:
