@@ -25,6 +25,9 @@ func MergeDirectories(a, b model.FileInfo, dedupe bool) model.FileInfo {
 				*ex = merged
 			} else if !ch.IsDir && !dedupe {
 				result.Children = append(result.Children, ch)
+			} else if !ch.IsDir && dedupe {
+				// skip duplicate file
+				continue
 			}
 		} else {
 			result.Children = append(result.Children, ch)
@@ -32,6 +35,21 @@ func MergeDirectories(a, b model.FileInfo, dedupe bool) model.FileInfo {
 		}
 	}
 
+	// ⚠️ финальный проход для удаления возможных повторов по FullName (страховка)
+	if dedupe {
+		unique := make([]model.FileInfo, 0, len(result.Children))
+		seen := make(map[string]bool)
+		for _, ch := range result.Children {
+			if seen[ch.FullName] {
+				continue
+			}
+			seen[ch.FullName] = true
+			unique = append(unique, ch)
+		}
+		result.Children = unique
+	}
+
+	// пересчёт размеров и сортировка
 	var total int64
 	for i := range result.Children {
 		total += result.Children[i].SizeBytes
