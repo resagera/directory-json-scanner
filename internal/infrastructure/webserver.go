@@ -9,7 +9,10 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
+	"fsjson/internal/config"
 	"fsjson/internal/domain/model"
 	"fsjson/internal/domain/service"
 )
@@ -54,11 +57,13 @@ func StartWebServer(jsonPath string) {
 		params := service.SearchParams{
 			Query:     q.Get("query"),
 			Path:      q.Get("path"),
-			Type:      q.Get("type"),
+			Types:     strings.Split(q.Get("types"), ","),
 			Recursive: q.Get("recursive") != "false",
 			Limit:     parseInt(q.Get("limit"), 100),
 			Offset:    parseInt(q.Get("offset"), 0),
 			SizeCmp:   parseSizeFilters(q),
+			Created:   parseTimeFiltersFromQuery(q, "created"),
+			Modified:  parseTimeFiltersFromQuery(q, "modified"),
 		}
 		results := service.SearchFiles(&root, params)
 		writeJSON(w, results)
@@ -104,6 +109,19 @@ func parseInt(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+func parseTimeFiltersFromQuery(q url.Values, prefix string) map[string]time.Time {
+	m := make(map[string]time.Time)
+	for _, op := range []string{"gt", "gte", "lt", "lte"} {
+		key := prefix + "." + op
+		if v := q.Get(key); v != "" {
+			if t, err := config.ParseISOTime(v); err == nil {
+				m[op] = t
+			}
+		}
+	}
+	return m
 }
 
 var indexHTML = `

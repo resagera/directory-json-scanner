@@ -233,6 +233,15 @@ go test ./internal/domain/service -v -run MergeChildren
 ./build --file=4tbWdPortable.json --search --query="*.mp4" --type=video --size.gt=100000000
 ```
 
+```bash
+./build --file=data.json --search \
+  --query="*.jpg" \
+  --created.gt=2025-01-01 \
+  --modified.lt=2025-11-01T00:00:00 \
+  --type=image --limit=5
+
+```
+
 ### Через браузер/API:
 
 ```
@@ -248,6 +257,28 @@ http://localhost:8080/api/search?query=*.jpg&type=image&size.lt=500000&recursive
 ]
 ```
 
+
+```
+GET /api/search?query=*.go&type=code&modified.gt=2025-11-01T00:00:00Z
+```
+
+Ответ:
+
+```json
+{
+  "results": [
+    {
+      "FullPathOrig": "/projects/app/main.go",
+      "SizeBytes": 4213,
+      "FileType": "code",
+      "Modified": "2025-11-03T09:42:12Z"
+    }
+  ],
+  "stats": {"code":1},
+  "total": 1
+}
+
+```
 
 ## 🧾 Лицензия
 

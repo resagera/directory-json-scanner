@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"fsjson/internal/app"
+	"fsjson/internal/config"
 	"fsjson/internal/domain/model"
 	"fsjson/internal/domain/service"
 	"fsjson/internal/infrastructure"
@@ -35,10 +36,14 @@ var (
 	searchQuery       = flag.String("query", "", "Запрос поиска")
 	searchPath        = flag.String("path", "", "Путь для поиска")
 	searchTypeFile    = flag.String("type", "", "Поиск по типу")
+	searchLimit       = flag.Int("limit", 100, "Поиск по типу")
+	searchOffset      = flag.Int("offset", 0, "Поиск по типу")
+	searchCreated     = flag.String("created", "", "Поиск по дате создания")
+	searchModified    = flag.String("modified", "", "Поиск по дате изменения")
 )
 
 func main() {
-	flag.Parse()
+	config.ParseFlagsSafe()
 
 	if *searchFlag {
 		if *fileFlag == "" {
@@ -57,16 +62,20 @@ func main() {
 		params := service.SearchParams{
 			Query:     *searchQuery,
 			Path:      *searchPath,
-			Type:      *searchTypeFile,
+			Types:     strings.Split(*searchTypeFile, ","),
 			Recursive: true,
-			Limit:     50,
+			Limit:     *searchLimit,
+			Offset:    *searchOffset,
+			//SizeCmp:   parseSizeFlags(),
+			Created:  config.ParseTimeFilters(*searchCreated),
+			Modified: config.ParseTimeFilters(*searchModified),
 		}
 
 		results := service.SearchFiles(&root, params)
-		for _, r := range results {
+		for _, r := range results.Results {
 			fmt.Printf("%s (%s, %d bytes)\n", r.FullPathOrig, r.FileType, r.SizeBytes)
 		}
-		fmt.Printf("🔍 Найдено %d элементов\n", len(results))
+		fmt.Printf("🔍 Найдено %d элементов\n", results.Total)
 		return
 	}
 
