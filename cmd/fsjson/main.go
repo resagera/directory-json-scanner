@@ -1,12 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"strings"
 
 	"fsjson/internal/app"
+	"fsjson/internal/domain/model"
+	"fsjson/internal/domain/service"
 	"fsjson/internal/infrastructure"
 )
 
@@ -26,10 +31,44 @@ var (
 	mergeChildrenFlag = flag.Bool("merge-children", false, "Объединять только дочерние элементы корней")
 	webFlag           = flag.Bool("web", false, "Запустить веб-интерфейс для просмотра JSON")
 	fileFlag          = flag.String("file", "", "JSON-файл для просмотра в веб-интерфейсе")
+	searchFlag        = flag.Bool("search", false, "Поиск по JSON-файлу (--file=...)")
+	searchQuery       = flag.String("query", "", "Запрос поиска")
+	searchPath        = flag.String("path", "", "Путь для поиска")
+	searchTypeFile    = flag.String("type", "", "Поиск по типу")
 )
 
 func main() {
 	flag.Parse()
+
+	if *searchFlag {
+		if *fileFlag == "" {
+			log.Fatal("Укажите JSON-файл через --file")
+		}
+		data, err := os.ReadFile(*fileFlag)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var root model.FileInfo
+		if err := json.Unmarshal(data, &root); err != nil {
+			log.Fatal(err)
+		}
+
+		// разбор параметров из env/cli (упрощённо)
+		params := service.SearchParams{
+			Query:     *searchQuery,
+			Path:      *searchPath,
+			Type:      *searchTypeFile,
+			Recursive: true,
+			Limit:     50,
+		}
+
+		results := service.SearchFiles(&root, params)
+		for _, r := range results {
+			fmt.Printf("%s (%s, %d bytes)\n", r.FullPathOrig, r.FileType, r.SizeBytes)
+		}
+		fmt.Printf("🔍 Найдено %d элементов\n", len(results))
+		return
+	}
 
 	// WEB режим
 	if *webFlag {

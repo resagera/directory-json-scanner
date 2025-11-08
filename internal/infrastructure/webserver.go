@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 
 	"fsjson/internal/domain/model"
+	"fsjson/internal/domain/service"
 )
 
 //go:embed static/*
@@ -46,6 +49,21 @@ func StartWebServer(jsonPath string) {
 
 	http.Handle("/static/", http.StripPrefix("/static/",
 		http.FileServer(http.FS(StaticFS))))
+	http.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		params := service.SearchParams{
+			Query:     q.Get("query"),
+			Path:      q.Get("path"),
+			Type:      q.Get("type"),
+			Recursive: q.Get("recursive") != "false",
+			Limit:     parseInt(q.Get("limit"), 100),
+			Offset:    parseInt(q.Get("offset"), 0),
+			SizeCmp:   parseSizeFilters(q),
+		}
+		results := service.SearchFiles(&root, params)
+		writeJSON(w, results)
+	})
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -64,6 +82,28 @@ func findNodeByPath(node *model.FileInfo, path string) *model.FileInfo {
 		}
 	}
 	return nil
+}
+func parseSizeFilters(q url.Values) map[string]int64 {
+	m := make(map[string]int64)
+	for _, k := range []string{"gt", "gte", "lt", "lte", "eq"} {
+		if v := q.Get("size." + k); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				m[k] = n
+			}
+		}
+	}
+	return m
+}
+
+func parseInt(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 var indexHTML = `
